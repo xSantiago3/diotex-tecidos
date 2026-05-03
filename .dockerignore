@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+diotextecidos.db
+wc-product-export-3-5-2026-1777832500673.csv
