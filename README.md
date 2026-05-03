@@ -220,6 +220,13 @@ Limite atual deste ambiente:
 - nao ha `gh` instalado nem autenticacao GitHub configurada aqui
 - por isso eu consigo deixar o repositorio pronto localmente, mas nao consigo criar o remoto e fazer push sem credenciais
 
+Script pronto para quando houver credencial:
+
+```bash
+chmod +x scripts/create_github_repo.sh
+GITHUB_USERNAME=seu-usuario GITHUB_TOKEN=seu-token REPO_NAME=diotex-tecidos ./scripts/create_github_repo.sh
+```
+
 ## Regras de seguranca implementadas no scaffold
 
 - cliente so consulta pedidos do proprio numero de WhatsApp;
