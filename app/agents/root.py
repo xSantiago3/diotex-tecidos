@@ -9,6 +9,7 @@ from app.agents.tools import (
     create_order_quote,
     get_order_status,
     list_my_orders,
+    list_product_categories,
     quote_shipping,
     remove_from_cart,
     request_admin_otp,
@@ -28,16 +29,15 @@ catalog_agent = Agent(
     description="Consulta produtos, preco, composicao e fotos.",
     instruction=(
         "Voce atende uma loja de tecidos. Responda duvidas sobre catalogo, atributos, preco e fotos. "
-        "REGRA FUNDAMENTAL: NUNCA responda sobre quais tecidos ou produtos estao disponiveis com base na memoria da conversa. "
-        "Sempre chame search_products antes de responder qualquer pergunta sobre catalogo. "
-        "Quando o cliente perguntar quais tecidos temos, o que vendemos ou pedir uma visao geral do catalogo, "
-        "chame search_products com query='' e limit=200 para obter todos os tipos disponiveis, depois agrupe e resuma por tipo de tecido (ex: Oxford, Helanca, Linho, Two Way, Chifon, Viscose, Chita). "
-        "Quando o cliente ja souber o tipo e quiser ver opcoes, chame search_products com o nome do tipo como query. "
+        "REGRA FUNDAMENTAL: NUNCA responda sobre quais tecidos estao disponiveis com base na memoria da conversa. "
+        "Quando o cliente perguntar quais tipos de tecido, categorias ou o que a loja vende em geral, "
+        "chame list_product_categories para listar as categorias do catalogo ativo. "
+        "Quando o cliente ja souber o tipo e quiser ver opcoes ou detalhes, chame search_products com o nome do tipo como query. "
         "Quando o cliente pedir para ver fotos/imagens/opcoes visuais ou links dos produtos, use a tool send_catalog_media. "
         "Nunca altere preco, descricao, estoque ou regras comerciais. "
         "Se o cliente pedir imagens, confirme que voce pode enviar fotos dos produtos sem expor URL de imagem no texto."
     ),
-    tools=[search_products, send_catalog_media],
+    tools=[list_product_categories, search_products, send_catalog_media],
 )
 
 sales_agent = Agent(
@@ -47,16 +47,15 @@ sales_agent = Agent(
     instruction=(
         "Voce ajuda o cliente a escolher tecidos para moda, decoracao e artesanato. "
         "REGRA FUNDAMENTAL: NUNCA recomende ou mencione tipos de tecido com base na memoria da conversa — sempre consulte o banco primeiro. "
-        "Quando o cliente pedir opcoes, variedades ou quiser saber o que temos, chame search_products com query='' e limit=200, "
-        "depois agrupe os resultados por tipo de tecido e apresente um resumo com preco e caracteristicas de cada tipo. "
-        "Use search_products com um termo especifico quando o cliente ja souber o que quer (ex: 'linho', 'viscose'). "
+        "Quando o cliente pedir opcoes, variedades ou quiser saber o que temos em geral, chame list_product_categories para listar as categorias disponiveis. "
+        "Quando o cliente ja souber o tipo ou quiser detalhes de um tecido especifico, chame search_products com o nome do tipo. "
         "Quando o cliente pedir fotos/imagens ou links das opcoes recomendadas, use send_catalog_media para fazer o envio. "
         "Nunca ofereca tipo de tecido sem confirmar no resultado da tool. "
         "Se search_products retornar zero para um termo (ex: seda), diga claramente que nao ha disponibilidade desse termo no catalogo atual. "
         "Nao conceda descontos e nao prometa nada fora das regras comerciais. "
         "Quando houver fechamento de compra, encaminhe para checkout."
     ),
-    tools=[search_products, send_catalog_media],
+    tools=[list_product_categories, search_products, send_catalog_media],
 )
 
 checkout_agent = Agent(

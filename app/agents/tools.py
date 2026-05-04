@@ -64,6 +64,38 @@ def _sync_post(path: str, body: dict) -> dict[str, Any]:
 # Catalog
 # ---------------------------------------------------------------------------
 
+def list_product_categories() -> dict[str, Any]:
+    """Lista as categorias de tecidos disponíveis na loja.
+
+    Use esta tool quando o cliente perguntar quais tipos de tecido, quais categorias
+    ou o que a loja vende em geral. Retorna nomes limpos como 'Oxford', 'Helanca', etc.
+
+    Returns:
+        Lista de categorias disponíveis no catálogo ativo.
+    """
+    try:
+        with get_db_session() as session:
+            from sqlmodel import distinct as sql_distinct
+            rows = session.exec(
+                select(sql_distinct(Product.categories))
+                .where(Product.active == True, Product.categories != None)  # noqa: E712
+            ).all()
+
+            seen: set[str] = set()
+            for raw in rows:
+                for part in raw.split(","):
+                    part = part.strip()
+                    # Remove prefixo "Tecidos > " e "Todos"
+                    if " > " in part:
+                        part = part.split(" > ", 1)[1].strip()
+                    if part and part.lower() != "todos":
+                        seen.add(part)
+
+            return {"categories": sorted(seen)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def search_products(query: str = "", limit: int = 10) -> dict[str, Any]:
     """Busca produtos no catálogo da loja pelo nome ou palavra-chave.
 
