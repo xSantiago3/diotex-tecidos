@@ -21,6 +21,10 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _is_test_token(token: str | None) -> bool:
+    return bool(token and token.startswith("TEST-"))
+
+
 async def create_pix_payment(
     order_id: int,
     total_amount: float,
@@ -143,7 +147,7 @@ async def create_payment_link(
     if not settings.mercadopago_access_token:
         return {"error": "MERCADOPAGO_ACCESS_TOKEN nao configurado."}
 
-    body = {
+    body: dict[str, Any] = {
         "items": [
             {
                 "title": description,
@@ -152,14 +156,18 @@ async def create_payment_link(
                 "unit_price": round(float(total_amount), 2),
             }
         ],
-        "payer": {
-            "name": customer_name or "Cliente",
-            "email": customer_email or "comprador@diotextecidos.com.br",
-        },
         "external_reference": str(order_id),
         "notification_url": "https://diotex-tecidos-api-298996329023.us-central1.run.app/webhooks/mercadopago",
         "statement_descriptor": "DIOTEXT",
     }
+
+    # Em modo TEST, não fixamos payer para evitar conflito "uma das partes é de teste"
+    # quando o comprador loga com usuário de teste diferente do e-mail informado.
+    if not _is_test_token(settings.mercadopago_access_token):
+        body["payer"] = {
+            "name": customer_name or "Cliente",
+            "email": customer_email or "comprador@diotextecidos.com.br",
+        }
 
     async with httpx.AsyncClient(timeout=20) as client:
         try:
@@ -202,6 +210,10 @@ async def create_payment_link(
 
     return {
         "preference_id": data.get("id"),
-        "payment_link": data.get("init_point") or data.get("sandbox_init_point"),
+        "payment_link": (
+            data.get("sandbox_init_point")
+            if _is_test_token(settings.mercadopago_access_token)
+            else data.get("init_point")
+        ),
         "sandbox_payment_link": data.get("sandbox_init_point"),
     }

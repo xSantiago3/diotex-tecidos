@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     order_separation_template_name: str = Field(default="separar_pedido", alias="ORDER_SEPARATION_TEMPLATE_NAME")
     pix_awaiting_template_name: str = Field(default="pedido_aguardando_pix", alias="PIX_AWAITING_TEMPLATE_NAME")
     pix_review_template_name: str = Field(default="avaliar_pagamento_pix", alias="PIX_REVIEW_TEMPLATE_NAME")
+    # Telefone para notificações de pagamento aprovado (padrão: mesmo do admin)
+    notification_phone: str = Field(default="+5511982732814", alias="NOTIFICATION_PHONE")
     # Internal maintenance endpoints token
     scheduler_token: str | None = Field(default=None, alias="SCHEDULER_TOKEN")
 

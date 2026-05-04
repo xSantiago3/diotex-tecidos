@@ -1,23 +1,54 @@
+# Environment
 .env
 .env.*
+!.env.example
+
+# Secrets & Keys
 .keys/
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.DS_Store
-diotextecidos.db
-*.sqlite
-*.log
-wc-product-export-*.csv
-dist/
-build/
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
 *.pem
 *.key
 service-account*.json
 *-service-account.json
 credentials*.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Database
+diotextecidos.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Data exports
+wc-product-export-*.csv
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local testing docs (development only)
+BLUEPRINT_*.md
+QUICK_TEST.md
+TESTING*.md
+LOCAL_*.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.iml

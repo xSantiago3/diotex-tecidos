@@ -52,6 +52,10 @@ def _ensure_sqlite_schema_updates() -> None:
             existing_customer_columns = {row[1] for row in customer_table_info}
             if "zipcode" not in existing_customer_columns:
                 connection.execute(text("ALTER TABLE customer ADD COLUMN zipcode TEXT"))
+            if "address_number" not in existing_customer_columns:
+                connection.execute(text("ALTER TABLE customer ADD COLUMN address_number TEXT"))
+            if "cpf" not in existing_customer_columns:
+                connection.execute(text("ALTER TABLE customer ADD COLUMN cpf TEXT"))
 
 
 def init_db() -> None:

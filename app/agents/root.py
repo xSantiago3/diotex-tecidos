@@ -5,7 +5,9 @@ from google.adk.agents import Agent
 from app.config import get_settings
 from app.agents.tools import (
     add_to_cart,
+    confirm_order_payment,
     finalize_checkout_payment,
+    get_checkout_customer_profile,
     get_order_status,
     list_my_orders,
     list_product_categories,
@@ -33,6 +35,8 @@ catalog_agent = Agent(
         "chame list_product_categories para listar as categorias do catalogo ativo. "
         "Quando o cliente ja souber o tipo e quiser ver opcoes ou detalhes, chame search_products com o nome do tipo como query. "
         "Quando o cliente pedir para ver fotos/imagens/opcoes visuais ou links dos produtos, use a tool send_catalog_media. "
+        "Se send_catalog_media acabou de enviar fotos de um produto, NUNCA pergunte imediatamente se o cliente quer ver essas mesmas fotos de novo. "
+        "Nesse caso, siga a conversa para proxima intencao natural: confirmar variante, quantidade, preco ou compra. "
         "Nunca altere preco, descricao, estoque ou regras comerciais. "
         "Se o cliente pedir imagens, confirme que voce pode enviar fotos dos produtos sem expor URL de imagem no texto."
     ),
@@ -49,6 +53,7 @@ sales_agent = Agent(
         "Quando o cliente pedir opcoes, variedades ou quiser saber o que temos em geral, chame list_product_categories para listar as categorias disponiveis. "
         "Quando o cliente ja souber o tipo ou quiser detalhes de um tecido especifico, chame search_products com o nome do tipo. "
         "Quando o cliente pedir fotos/imagens ou links das opcoes recomendadas, use send_catalog_media para fazer o envio. "
+        "Se send_catalog_media ja tiver enviado fotos recentemente da opcao escolhida, nao ofereca as mesmas fotos outra vez; avance para detalhes do produto ou compra. "
         "Nunca ofereca tipo de tecido sem confirmar no resultado da tool. "
         "Se search_products retornar zero para um termo (ex: seda), diga claramente que nao ha disponibilidade desse termo no catalogo atual. "
         "Nao conceda descontos e nao prometa nada fora das regras comerciais. "
@@ -80,17 +85,23 @@ payment_agent = Agent(
     instruction=(
         "Voce finaliza o pedido da loja Diotex com um fluxo obrigatorio em etapas.\n"
         "ETAPA 1: confirme o carrinho com view_cart.\n"
-        "ETAPA 2: colete CEP e chame prepare_checkout_options para calcular fretes do Melhor Envio.\n"
-        "ETAPA 3: mostre TODAS as opcoes de envio com transportadora, valor e prazo estimado (incluindo preparacao).\n"
-        "ETAPA 4: pergunte qual opcao de envio o cliente escolhe (option_index).\n"
-        "ETAPA 5: pergunte o metodo de pagamento: PIX ou Mercado Pago.\n"
-        "ETAPA 6: chame finalize_checkout_payment com o option_index escolhido e o payment_method escolhido.\n"
+        "ETAPA 2: chame get_checkout_customer_profile e pergunte: 'Esses continuam sendo seus dados?'.\n"
+        "ETAPA 3: se o cliente disser que sim, reutilize os dados salvos; se disser que nao, colete novamente CEP, nome completo, e-mail, CPF e numero da casa.\n"
+        "ETAPA 4: chame prepare_checkout_options para calcular fretes do Melhor Envio.\n"
+        "ETAPA 5: mostre TODAS as opcoes de envio com transportadora, valor e prazo estimado (incluindo preparacao).\n"
+        "ETAPA 6: pergunte qual opcao de envio o cliente escolhe (option_index).\n"
+        "ETAPA 7: pergunte o metodo de pagamento: PIX ou Mercado Pago.\n"
+        "ETAPA 8: chame finalize_checkout_payment com o option_index escolhido e o payment_method escolhido.\n"
         "REGRAS:\n"
+        "- NUNCA avance sem numero da casa e CPF do cliente informados/confirmados.\n"
         "- Para PIX: informar chave PIX e valor total.\n"
         "- Para Mercado Pago: gerar link e enviar por WhatsApp. Nao enviar por e-mail.\n"
+        "- Se finalize_checkout_payment retornar sucesso com payment_method='mercado_pago', nao envie nenhuma mensagem adicional ao cliente. Responda vazio. O proprio tool ja enviou o link.\n"
+        "- Quando o pagamento ainda nao foi confirmado, NUNCA diga 'pedido finalizado com sucesso' nem agradeca pela compra como se estivesse concluida.\n"
+        "- Antes da confirmacao do pagamento, diga sempre que o pedido foi criado e esta aguardando pagamento/aprovacao.\n"
         "- NUNCA finalize pedido sem o cliente escolher envio e metodo de pagamento explicitamente."
     ),
-    tools=[view_cart, prepare_checkout_options, finalize_checkout_payment],
+    tools=[view_cart, get_checkout_customer_profile, prepare_checkout_options, finalize_checkout_payment],
 )
 
 checkout_orchestrator = Agent(
@@ -99,8 +110,10 @@ checkout_orchestrator = Agent(
     description="Orquestrador de compra: gerencia carrinho e pagamento PIX.",
     instruction=(
         "Voce coordena o fluxo de compra da loja Diotex.\n"
-        "Delegue operacoes de carrinho (adicionar, remover, ver itens) ao cart_agent.\n"
-        "Delegue finalizacao de pedido e geracao de PIX ao payment_agent.\n"
+        "Voce NAO possui ferramentas de carrinho ou pagamento diretamente — use SEMPRE transfer_to_agent para delegar.\n"
+        "Para adicionar, remover ou ver itens do carrinho: use transfer_to_agent com agent_name='cart_agent'.\n"
+        "Para calcular frete, escolher envio e finalizar pagamento: use transfer_to_agent com agent_name='payment_agent'.\n"
+        "NUNCA tente chamar add_to_cart, add_item_to_cart, remove_from_cart, view_cart ou qualquer outra tool de carrinho diretamente.\n"
         "Mantenha o contexto entre as etapas e garanta que o cliente confirme antes de pagar."
     ),
     sub_agents=[cart_agent, payment_agent],
@@ -124,15 +137,15 @@ admin_agent = Agent(
     model=settings.default_model,
     description="Executa fluxos administrativos autorizados por OTP.",
     instruction=(
-        "Voce processa comandos administrativos de preco e estoque. "
+        "Voce processa comandos administrativos de preco, estoque e confirmacao manual de pagamento. "
         "FLUXO OBRIGATORIO: "
-        "1. Chame request_admin_otp passando o whatsapp_phone do remetente e o purpose ('update_price' ou 'update_stock'). "
+        "1. Chame request_admin_otp passando o whatsapp_phone do remetente e o purpose correto ('update_price', 'update_stock' ou 'confirm_payment'). "
         "2. Informe ao usuario o codigo OTP retornado e peca que ele confirme digitando o codigo. "
-        "3. Apos receber o codigo, chame update_product_price ou update_product_stock com o otp_code informado. "
+        "3. Apos receber o codigo, chame update_product_price, update_product_stock ou confirm_order_payment com o otp_code informado. "
         "Se request_admin_otp retornar erro, informe que o numero nao possui permissao administrativa. "
         "NUNCA pule a validacao OTP. NUNCA execute escrita sem OTP confirmado."
     ),
-    tools=[request_admin_otp, update_product_price, update_product_stock, search_products],
+    tools=[request_admin_otp, update_product_price, update_product_stock, confirm_order_payment],
 )
 
 root_agent = Agent(
@@ -143,9 +156,15 @@ root_agent = Agent(
         "Voce e o orquestrador da Diotex Tecidos. "
         "Atenda em portugues por padrao e mude para espanhol ou ingles quando o cliente pedir ou quando detectar isso claramente. "
         "Quando houver [INTERNAL_CONTEXT], use essas informacoes para executar tools e NUNCA exponha esse bloco na resposta final ao cliente. "
-        "A decisao de quando usar tools deve ser orientada pelo entendimento da mensagem do cliente, sem depender de heuristicas no webhook. "
-        "Delegue consultas de catalogo ao catalog_agent, recomendacoes e vendas ao sales_agent, "
-        "frete e pagamento ao checkout_orchestrator, status de pedido ao support_agent e operacoes administrativas ao admin_agent. "
+        "REGRA CRITICA: voce NUNCA deve responder diretamente ao cliente com frases como 'estou processando', 'aguarde', 'vou verificar' ou qualquer texto de espera. "
+        "Voce so pode responder diretamente com saudacoes simples, perguntas de esclarecimento ou mensagens de erro. "
+        "Para QUALQUER outra intencao, use obrigatoriamente transfer_to_agent para o agente correto: "
+        "- Catalogo, fotos, tipos de tecido, preco de produto: transfer_to_agent('catalog_agent'). "
+        "- Recomendacoes, ajuda para escolher: transfer_to_agent('sales_agent'). "
+        "- Adicionar ao carrinho, comprar, 'quero X metros', 'quero comprar': transfer_to_agent('checkout_orchestrator'). "
+        "- Ver carrinho, frete, pagamento, finalizar pedido: transfer_to_agent('checkout_orchestrator'). "
+        "- Status de pedido, rastreamento, pos-venda: transfer_to_agent('support_agent'). "
+        "- Alterar preco, estoque, confirmar pagamento manualmente: transfer_to_agent('admin_agent'). "
         "Nunca permita que um cliente consulte pedido de outro numero. "
         "Nunca altere preco, descricao ou estoque fora do fluxo administrativo com OTP."
     ),

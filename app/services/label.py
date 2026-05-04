@@ -110,10 +110,25 @@ async def generate_label_for_order(
         for i in items
     ]
 
-    phone_digits = "".join(c for c in (customer.whatsapp_phone or "") if c.isdigit())
+    def _read_customer(key: str, default: str = "") -> str:
+        if isinstance(customer, dict):
+            return str(customer.get(key, default) or default)
+        return str(getattr(customer, key, default) or default)
+
+    phone_digits = "".join(c for c in _read_customer("whatsapp_phone") if c.isdigit())
     # Remove DDI 55 se presente
     if phone_digits.startswith("55") and len(phone_digits) > 11:
         phone_digits = phone_digits[2:]
+
+    sender_document_digits = "".join(c for c in (settings.me_sender_document or "") if c.isdigit())
+    if len(sender_document_digits) not in (11, 14):
+        raise RuntimeError(
+            "ME_SENDER_DOCUMENT invalido. Informe CPF (11 digitos) ou CNPJ (14 digitos) do remetente."
+        )
+    customer_cpf_digits = "".join(c for c in _read_customer("cpf") if c.isdigit())
+    customer_name = _read_customer("name", "Cliente")
+    customer_email = _read_customer("email")
+    customer_address_number = _read_customer("address_number")
 
     cart_body: dict[str, Any] = {
         "service": int(service_code),
@@ -121,7 +136,7 @@ async def generate_label_for_order(
             "name": settings.me_sender_name,
             "email": settings.me_sender_email,
             "phone": settings.me_sender_phone or phone_digits,
-            "document": settings.me_sender_document,
+            "document": sender_document_digits,
             "state_register": "ISENTO",
             "address": settings.me_sender_address or "Endereço não configurado",
             "number": settings.me_sender_number or "S/N",
@@ -131,14 +146,14 @@ async def generate_label_for_order(
             "state_abbr": settings.me_sender_state,
         },
         "to": {
-            "name": customer.name or "Cliente",
-            "email": customer.email or "",
+            "name": customer_name,
+            "email": customer_email,
             "phone": phone_digits,
-            "document": "",
+            "document": customer_cpf_digits,
             "state_register": "ISENTO",
             "address": dest_addr.get("logradouro") or "Rua não informada",
             "complement": "",
-            "number": customer.address_number or "S/N",
+            "number": customer_address_number or "S/N",
             "district": dest_addr.get("bairro") or "Centro",
             "city": dest_addr.get("localidade") or "",
             "postal_code": dest_cep,

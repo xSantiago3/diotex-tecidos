@@ -23,6 +23,7 @@ class Customer(SQLModel, table=True):
     whatsapp_phone: str = Field(index=True, unique=True)
     name: str | None = None
     email: str | None = None
+    cpf: str | None = Field(default=None, index=True)
     zipcode: str | None = Field(default=None, index=True)
     address_number: str | None = None  # número da casa/comercio
     preferred_language: str = Field(default="pt-BR")

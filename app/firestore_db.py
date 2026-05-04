@@ -95,6 +95,7 @@ async def upsert_customer_firestore(
     whatsapp_phone: str,
     name: str | None = None,
     email: str | None = None,
+    cpf: str | None = None,
     zipcode: str | None = None,
     address_number: str | None = None,
 ) -> dict[str, Any]:
@@ -110,6 +111,8 @@ async def upsert_customer_firestore(
             updates["name"] = name
         if email:
             updates["email"] = email
+        if cpf:
+            updates["cpf"] = cpf
         if zipcode:
             updates["zipcode"] = zipcode
         if address_number:
@@ -124,6 +127,7 @@ async def upsert_customer_firestore(
             "whatsapp_phone": whatsapp_phone,
             "name": name,
             "email": email,
+            "cpf": cpf,
             "zipcode": zipcode,
             "address_number": address_number,
             "is_admin": False,

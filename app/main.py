@@ -44,7 +44,7 @@ from app.schemas import (
 )
 from app.services.catalog import list_catalog_products
 from app.services.checkout import create_checkout_quote
-from app.agents.runtime import run_agent_message
+from app.agents.runtime import run_agent_message, reset_session
 from app.services.mercadopago import get_payment
 from app.services.security import build_otp_code, start_admin_otp, verify_admin_otp
 from app.services.shipping import calculate_shipping_quote
@@ -642,6 +642,17 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
     return {"notified": True, "order_id": order_id}
 
 
+@app.post("/internal/reset-session/{phone}")
+async def reset_agent_session(phone: str, request: Request) -> dict[str, Any]:
+    """Apaga e recria a sessão ADK de um número, zerando o histórico da conversa."""
+    token = request.headers.get("X-Scheduler-Token") or request.query_params.get("token")
+    if token != settings.scheduler_token:
+        raise HTTPException(status_code=401, detail="Token inválido.")
+    await reset_session(user_id=phone, session_id=phone)
+    log.info("Sessão resetada para %s", phone)
+    return {"reset": True, "phone": phone}
+
+
 @app.post("/internal/maintenance/cleanup-expired-orders")
 def cleanup_expired_orders(
     request: Request,
@@ -811,12 +822,18 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
                             order_id, label_result.shipment_id, tracking_code,
                         )
                     except Exception as label_exc:
+                        label_error_text = str(label_exc)
+                        if "from.document" in label_error_text:
+                            label_error_text = (
+                                "CPF/CNPJ do remetente invalido no Melhor Envio "
+                                "(configuracao ME_SENDER_DOCUMENT)."
+                            )
                         log.error("Falha ao gerar etiqueta ME para pedido #%s: %s", order_id, label_exc)
                         await send_whatsapp_message(
                             to_phone=settings.notification_phone,
                             text=(
                                 f"⚠️ *Falha ao gerar etiqueta automática*\n"
-                                f"Pedido #{order_id}\nMotivo: {label_exc}\n"
+                                f"Pedido #{order_id}\nMotivo: {label_error_text}\n"
                                 "Gere manualmente no painel do Melhor Envio."
                             ),
                         )
@@ -854,6 +871,13 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
                         log.error(
                             "Falha ao enviar template de confirmacao para %s: %s",
                             customer_phone, template_result,
+                        )
+                        await send_whatsapp_message(
+                            to_phone=customer_phone,
+                            text=(
+                                f"Pagamento aprovado com sucesso para o pedido #{order_id}. "
+                                "Agora vamos iniciar a separacao para envio."
+                            ),
                         )
                     else:
                         log.info("Template pedido_confirmado enviado para %s", customer_phone)
@@ -923,12 +947,18 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
                     order.id, label_result.shipment_id, tracking_code,
                 )
             except Exception as label_exc:
+                label_error_text = str(label_exc)
+                if "from.document" in label_error_text:
+                    label_error_text = (
+                        "CPF/CNPJ do remetente invalido no Melhor Envio "
+                        "(configuracao ME_SENDER_DOCUMENT)."
+                    )
                 log.error("Falha ao gerar etiqueta ME para pedido #%s: %s", order.id, label_exc)
                 await send_whatsapp_message(
                     to_phone=settings.notification_phone,
                     text=(
                         f"⚠️ *Falha ao gerar etiqueta automática*\n"
-                        f"Pedido #{order.id}\nMotivo: {label_exc}\n"
+                        f"Pedido #{order.id}\nMotivo: {label_error_text}\n"
                         "Gere manualmente no painel do Melhor Envio."
                     ),
                 )
@@ -967,6 +997,13 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
                 log.error(
                     "Falha ao enviar template de confirmacao para %s: %s",
                     customer.whatsapp_phone, template_result,
+                )
+                await send_whatsapp_message(
+                    to_phone=customer.whatsapp_phone,
+                    text=(
+                        f"Pagamento aprovado com sucesso para o pedido #{order.id}. "
+                        "Agora vamos iniciar a separacao para envio."
+                    ),
                 )
             else:
                 log.info("Template pedido_confirmado enviado para %s", customer.whatsapp_phone)

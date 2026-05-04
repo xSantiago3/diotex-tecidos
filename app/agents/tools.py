@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import get_db_session
-from app.models import Cart, CartItem, Inventory, Order, OrderItem, OrderStatus, Product, ProductImage
+from app.models import Cart, CartItem, Customer, Inventory, Order, OrderItem, OrderStatus, Product, ProductImage
 from app.repositories import get_order_for_customer, upsert_customer
 from app.schemas import CheckoutItemRequest, CheckoutQuoteRequest, CustomerUpsert, ShippingProvider, ShippingQuoteRequest
 from app.services.checkout import create_checkout_quote
@@ -222,6 +222,7 @@ def search_products(query: str = "", limit: int = 10) -> dict[str, Any]:
 async def send_catalog_media(
     whatsapp_phone: str,
     query: str,
+    tool_context: ToolContext,
     include_images: bool = True,
     include_links: bool = False,
     limit: int = 8,
@@ -260,6 +261,7 @@ async def send_catalog_media(
         sent_images = 0
         sent_links = 0
         errors: list[str] = []
+        sent_item_names: list[str] = []
 
         for item in items:
             product_name = item.get("name") or "Produto"
@@ -278,6 +280,8 @@ async def send_catalog_media(
                     )
                 else:
                     sent_images += 1
+                    if product_name not in sent_item_names:
+                        sent_item_names.append(product_name)
 
             if include_links and product_url:
                 link_result = await send_whatsapp_message(
@@ -290,12 +294,20 @@ async def send_catalog_media(
                     )
                 else:
                     sent_links += 1
+                    if product_name not in sent_item_names:
+                        sent_item_names.append(product_name)
+
+        tool_context.state["last_media_query"] = query
+        tool_context.state["last_media_sent_items"] = sent_item_names
+        tool_context.state["last_media_include_images"] = include_images
+        tool_context.state["last_media_include_links"] = include_links
 
         return {
             "success": len(errors) == 0,
             "found": len(items),
             "sent_images": sent_images,
             "sent_links": sent_links,
+            "sent_item_names": sent_item_names,
             "errors": errors,
         }
     except Exception as exc:
@@ -540,6 +552,40 @@ def update_product_stock(
         return {"error": str(exc)}
 
 
+def confirm_order_payment(
+    whatsapp_phone: str,
+    otp_code: str,
+    order_id: int,
+) -> dict[str, Any]:
+    """Confirma manualmente um pagamento pendente usando OTP administrativo.
+
+    Use quando um admin confirmar que o PIX caiu ou quiser marcar um pedido
+    pendente como pago manualmente.
+    """
+    try:
+        with get_db_session() as session:
+            verify_admin_otp(session, whatsapp_phone, "confirm_payment", otp_code)
+
+        result = _sync_post(
+            f"/internal/orders/{order_id}/confirm-payment",
+            {"approved_by": normalize_phone(whatsapp_phone)},
+        )
+        if result.get("error"):
+            return result
+        return {
+            "success": bool(result.get("confirmed")),
+            "order_id": order_id,
+            "status": result.get("status"),
+            "message": (
+                f"Pedido #{order_id} confirmado manualmente como pago."
+                if result.get("confirmed")
+                else result.get("message", "Nao foi possivel confirmar o pagamento.")
+            ),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Carrinho persistente
 # ---------------------------------------------------------------------------
@@ -690,11 +736,74 @@ def remove_from_cart(whatsapp_phone: str, product_id: int, tool_context: ToolCon
         return {"error": str(exc)}
 
 
+def get_checkout_customer_profile(whatsapp_phone: str, tool_context: ToolContext) -> dict[str, Any]:
+    """Retorna dados salvos do comprador para confirmar antes de gerar pedido.
+
+    Use esta tool no início do checkout para perguntar:
+    "Esses continuam sendo seus dados?"
+    """
+    try:
+        normalized_phone = normalize_phone(whatsapp_phone)
+        with get_db_session() as session:
+            customer = session.exec(
+                select(Customer).where(Customer.whatsapp_phone == normalized_phone)
+            ).first()
+
+        if not customer:
+            return {
+                "has_saved_data": False,
+                "customer_profile": {
+                    "zipcode": "",
+                    "full_name": "",
+                    "email": "",
+                    "cpf": "",
+                    "address_number": "",
+                },
+                "missing_fields": ["zipcode", "full_name", "email", "cpf", "address_number"],
+                "confirmation_prompt": (
+                    "Ainda nao encontrei dados salvos seus. "
+                    "Me informe CEP, nome completo, e-mail, CPF e numero da casa."
+                ),
+            }
+
+        profile = {
+            "zipcode": customer.zipcode or "",
+            "full_name": customer.name or "",
+            "email": customer.email or "",
+            "cpf": customer.cpf or "",
+            "address_number": customer.address_number or "",
+        }
+        missing_fields = [field for field, value in profile.items() if not value]
+
+        tool_context.state["shipping_cep"] = profile["zipcode"]
+        tool_context.state["customer_name"] = profile["full_name"]
+        tool_context.state["customer_email"] = profile["email"]
+        tool_context.state["customer_cpf"] = profile["cpf"]
+        tool_context.state["customer_address_number"] = profile["address_number"]
+
+        return {
+            "has_saved_data": True,
+            "customer_profile": profile,
+            "missing_fields": missing_fields,
+            "confirmation_prompt": (
+                "Esses continuam sendo seus dados?\\n"
+                f"CEP: {profile['zipcode'] or '-'}\\n"
+                f"Nome Completo: {profile['full_name'] or '-'}\\n"
+                f"email: {profile['email'] or '-'}\\n"
+                f"CPF: {profile['cpf'] or '-'}\\n"
+                f"Numero: {profile['address_number'] or '-'}"
+            ),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def _build_open_cart_checkout_snapshot(
     whatsapp_phone: str,
     zipcode: str,
     customer_name: str,
     customer_email: str,
+    customer_cpf: str,
     address_number: str,
 ) -> dict[str, Any]:
     with get_db_session() as session:
@@ -702,6 +811,7 @@ def _build_open_cart_checkout_snapshot(
             whatsapp_phone=whatsapp_phone,
             name=customer_name or None,
             email=customer_email or None,
+            cpf=customer_cpf or None,
             zipcode=zipcode or None,
         ))
         if address_number:
@@ -776,6 +886,7 @@ async def prepare_checkout_options(
     address_number: str = "",
     customer_name: str = "",
     customer_email: str = "",
+    customer_cpf: str = "",
 ) -> dict[str, Any]:
     """Calcula fretes do Melhor Envio e apresenta opções para o cliente escolher.
 
@@ -787,6 +898,8 @@ async def prepare_checkout_options(
     zipcode = zipcode or tool_context.state.get("shipping_cep", "")
     customer_name = customer_name or tool_context.state.get("customer_name", "")
     customer_email = customer_email or tool_context.state.get("customer_email", "")
+    customer_cpf = customer_cpf or tool_context.state.get("customer_cpf", "")
+    address_number = address_number or tool_context.state.get("customer_address_number", "")
 
     if not zipcode:
         return {"error": "CEP de entrega nao informado."}
@@ -796,6 +909,7 @@ async def prepare_checkout_options(
         zipcode=zipcode,
         customer_name=customer_name,
         customer_email=customer_email,
+        customer_cpf=customer_cpf,
         address_number=address_number,
     )
     if snapshot.get("error"):
@@ -834,6 +948,8 @@ async def prepare_checkout_options(
     tool_context.state["shipping_cep"] = zipcode
     tool_context.state["customer_name"] = customer_name
     tool_context.state["customer_email"] = customer_email
+    tool_context.state["customer_cpf"] = customer_cpf
+    tool_context.state["customer_address_number"] = address_number
     tool_context.state["checkout_shipping_options"] = options
     tool_context.state["checkout_cart_snapshot"] = snapshot
 
@@ -853,6 +969,7 @@ async def finalize_checkout_payment(
     zipcode: str = "",
     customer_name: str = "",
     customer_email: str = "",
+    customer_cpf: str = "",
 ) -> dict[str, Any]:
     """Fecha o pedido após escolha do frete e método de pagamento.
 
@@ -869,11 +986,17 @@ async def finalize_checkout_payment(
     zipcode = zipcode or tool_context.state.get("shipping_cep", "")
     customer_name = customer_name or tool_context.state.get("customer_name", "")
     customer_email = customer_email or tool_context.state.get("customer_email", "")
+    customer_cpf = customer_cpf or tool_context.state.get("customer_cpf", "")
+    address_number = address_number or tool_context.state.get("customer_address_number", "")
 
     if not zipcode:
         return {"error": "CEP de entrega nao informado."}
+    if not address_number:
+        return {"error": "Numero da casa nao informado."}
     if not customer_name:
         return {"error": "Nome do cliente nao informado."}
+    if not customer_cpf:
+        return {"error": "CPF do cliente nao informado."}
     if payment_method == "mercado_pago" and not customer_email:
         return {"error": "E-mail do cliente nao informado para Mercado Pago."}
 
@@ -897,6 +1020,7 @@ async def finalize_checkout_payment(
         zipcode=zipcode,
         customer_name=customer_name,
         customer_email=customer_email,
+        customer_cpf=customer_cpf,
         address_number=address_number,
     )
     if fresh_snapshot.get("error"):
@@ -937,6 +1061,8 @@ async def finalize_checkout_payment(
         session.commit()
 
     tool_context.state["last_order_id"] = order_id
+    tool_context.state["customer_cpf"] = customer_cpf
+    tool_context.state["customer_address_number"] = address_number
 
     if payment_method == "pix":
         pix_key = settings.pix_key or "PIX indisponivel"
@@ -944,9 +1070,9 @@ async def finalize_checkout_payment(
             await send_whatsapp_message(
                 to_phone=whatsapp_phone,
                 text=(
-                    f"Pagamento via PIX selecionado.\\n"
-                    f"Pedido #{order_id}\\n"
-                    f"Valor total: R${total_amount:.2f}\\n"
+                    f"Pagamento via PIX selecionado.\n"
+                    f"Pedido #{order_id}\n"
+                    f"Valor total: R${total_amount:.2f}\n"
                     f"Chave PIX: {pix_key}"
                 ),
             )
@@ -955,10 +1081,16 @@ async def finalize_checkout_payment(
         return {
             "order_id": order_id,
             "payment_method": "pix",
+            "order_status": "payment_pending",
+            "payment_pending": True,
             "subtotal": subtotal,
             "shipping_amount": shipping_amount,
             "total_amount": total_amount,
             "pix_key": pix_key,
+            "customer_message_hint": (
+                "Pedido criado e aguardando pagamento via PIX. Nao diga que foi finalizado; "
+                "informe que o pagamento ainda precisa ser realizado e confirmado."
+            ),
             "shipping_selected": {
                 "carrier": selected_shipping.get("carrier_name"),
                 "service_name": selected_shipping.get("service_name"),
@@ -977,10 +1109,15 @@ async def finalize_checkout_payment(
         return {
             "order_id": order_id,
             "payment_method": "mercado_pago",
+            "order_status": "payment_pending",
+            "payment_pending": True,
             "subtotal": subtotal,
             "shipping_amount": shipping_amount,
             "total_amount": total_amount,
             "error": f"Pedido criado, mas nao foi possivel gerar link MP: {link_result['error']}",
+            "customer_message_hint": (
+                "Pedido criado, mas pagamento ainda nao concluido. Nao diga que foi finalizado."
+            ),
         }
 
     payment_link = link_result.get("payment_link")
@@ -988,9 +1125,9 @@ async def finalize_checkout_payment(
         await send_whatsapp_message(
             to_phone=whatsapp_phone,
             text=(
-                f"Pagamento via Mercado Pago selecionado.\\n"
-                f"Pedido #{order_id}\\n"
-                f"Valor total: R${total_amount:.2f}\\n"
+                f"Pagamento via Mercado Pago selecionado.\n"
+                f"Pedido #{order_id}\n"
+                f"Valor total: R${total_amount:.2f}\n"
                 f"Link para pagamento: {payment_link}"
             ),
         )
@@ -998,10 +1135,17 @@ async def finalize_checkout_payment(
     return {
         "order_id": order_id,
         "payment_method": "mercado_pago",
+        "order_status": "payment_pending",
+        "payment_pending": True,
         "subtotal": subtotal,
         "shipping_amount": shipping_amount,
         "total_amount": total_amount,
         "payment_link": payment_link,
+        "customer_message_hint": (
+            "O link de pagamento ja foi enviado ao cliente por WhatsApp. Nao envie nenhuma mensagem adicional agora. "
+            "A confirmacao ao cliente deve acontecer apenas apos o webhook do Mercado Pago aprovar o pagamento."
+        ),
+        "suppress_agent_reply": True,
         "shipping_selected": {
             "carrier": selected_shipping.get("carrier_name"),
             "service_name": selected_shipping.get("service_name"),
@@ -1017,6 +1161,7 @@ async def confirm_and_generate_pix(
     zipcode: str = "",
     customer_name: str = "",
     customer_email: str = "",
+    customer_cpf: str = "",
 ) -> dict[str, Any]:
     """Compatibilidade retroativa: mantém assinatura antiga e usa PIX manual.
 
@@ -1029,6 +1174,7 @@ async def confirm_and_generate_pix(
         address_number=address_number,
         customer_name=customer_name,
         customer_email=customer_email,
+        customer_cpf=customer_cpf,
     )
     if prep.get("error"):
         return prep
@@ -1042,5 +1188,6 @@ async def confirm_and_generate_pix(
         zipcode=zipcode,
         customer_name=customer_name,
         customer_email=customer_email,
+        customer_cpf=customer_cpf,
     )
 

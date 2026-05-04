@@ -16,6 +16,7 @@ class CustomerUpsert(BaseModel):
     whatsapp_phone: str
     name: str | None = None
     email: str | None = None
+    cpf: str | None = None
     zipcode: str | None = None
     preferred_language: str | None = None
 

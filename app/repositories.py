@@ -18,6 +18,7 @@ def upsert_customer(session: Session, data: CustomerUpsert) -> Customer:
             whatsapp_phone=normalized_phone,
             name=data.name,
             email=data.email,
+            cpf=data.cpf,
             zipcode=data.zipcode,
             preferred_language=data.preferred_language or "pt-BR",
         )
@@ -27,6 +28,8 @@ def upsert_customer(session: Session, data: CustomerUpsert) -> Customer:
             customer.name = data.name
         if data.email is not None:
             customer.email = data.email
+        if data.cpf is not None:
+            customer.cpf = data.cpf
         if data.zipcode is not None:
             customer.zipcode = data.zipcode
         if data.preferred_language is not None:
