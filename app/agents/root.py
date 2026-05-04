@@ -58,37 +58,53 @@ sales_agent = Agent(
     tools=[list_product_categories, search_products, send_catalog_media],
 )
 
-checkout_agent = Agent(
-    name="checkout_agent",
+cart_agent = Agent(
+    name="cart_agent",
     model=settings.default_model,
-    description="Gerencia carrinho, calcula frete e processa pagamento PIX.",
+    description="Gerencia o carrinho de compras: adicionar, remover e visualizar itens.",
     instruction=(
-        "Voce gerencia o carrinho e o pagamento da loja de tecidos Diotex.\n"
-        "Decida autonomamente quando chamar as tools necessarias em cada etapa.\n"
-        "\n"
-        "FLUXO DE CARRINHO:\n"
-        "1. Quando o cliente quiser comprar, use add_to_cart para adicionar o produto (product_id, quantity).\n"
-        "2. Apos adicionar, mostre o resumo do carrinho: itens, quantidades, valor unitario e subtotal.\n"
-        "3. Pergunte se o cliente deseja continuar comprando ou fechar o pedido.\n"
-        "4. O cliente pode adicionar mais itens (repita o passo 1) ou remover com remove_from_cart.\n"
-        "5. Use view_cart a qualquer momento para mostrar o carrinho atual.\n"
-        "\n"
-        "FLUXO DE FECHAMENTO (somente quando o cliente confirmar que quer fechar):\n"
-        "1. Se ainda nao souber o CEP, pergunte o CEP de entrega.\n"
-        "2. Pergunte o NUMERO da casa ou comercio para entrega.\n"
-        "3. Pergunte o nome completo do cliente (se ainda nao tiver).\n"
-        "4. Pergunte o e-mail do cliente (necessario para gerar o PIX).\n"
-        "5. Chame confirm_and_generate_pix com todos os dados coletados.\n"
-        "6. Apresente o codigo PIX copia-e-cola e o valor total (incluindo frete).\n"
-        "7. Informe que o pedido sera processado apos confirmacao do pagamento.\n"
-        "\n"
-        "REGRAS:\n"
-        "- Nunca gere o PIX sem confirmacao explicita do cliente.\n"
-        "- Apresente o prazo de envio como: prazo da transportadora + 2 dias de preparacao.\n"
-        "- Se o cliente perguntar sobre produtos, use search_products.\n"
-        "- Mantenha a conversa amigavel e objetiva."
+        "Voce gerencia o carrinho de compras da loja Diotex.\n"
+        "Use add_to_cart para adicionar produtos (product_id, quantity em metros).\n"
+        "Use remove_from_cart para remover um produto do carrinho.\n"
+        "Use view_cart para mostrar o conteudo atual do carrinho.\n"
+        "Se o cliente nao souber o product_id, use search_products para encontrar o produto antes de adicionar.\n"
+        "Apos cada alteracao, mostre o resumo do carrinho com itens, quantidades e subtotal.\n"
+        "Quando o cliente confirmar que quer fechar o pedido, transfira para o payment_agent."
     ),
-    tools=[add_to_cart, view_cart, remove_from_cart, confirm_and_generate_pix, quote_shipping, search_products, send_catalog_media],
+    tools=[add_to_cart, view_cart, remove_from_cart, search_products],
+)
+
+payment_agent = Agent(
+    name="payment_agent",
+    model=settings.default_model,
+    description="Calcula frete, gera cotacao de pedido e processa pagamento PIX.",
+    instruction=(
+        "Voce finaliza o pedido e gera o pagamento PIX da loja Diotex.\n"
+        "FLUXO OBRIGATORIO antes de gerar o PIX — colete os dados abaixo se ainda nao tiver:\n"
+        "1. CEP de entrega.\n"
+        "2. Numero da casa ou comercio.\n"
+        "3. Nome completo do cliente.\n"
+        "4. E-mail do cliente.\n"
+        "Use quote_shipping para simular o frete antes de confirmar se o cliente quiser saber o valor.\n"
+        "Use create_order_quote para gerar uma pre-visualizacao do pedido completo (subtotal + frete + total).\n"
+        "Use confirm_and_generate_pix APENAS quando o cliente confirmar explicitamente que quer pagar.\n"
+        "Apresente o codigo PIX copia-e-cola, o valor total e o prazo estimado de entrega.\n"
+        "NUNCA gere o PIX sem confirmacao explicita do cliente."
+    ),
+    tools=[quote_shipping, create_order_quote, confirm_and_generate_pix],
+)
+
+checkout_orchestrator = Agent(
+    name="checkout_orchestrator",
+    model=settings.default_model,
+    description="Orquestrador de compra: gerencia carrinho e pagamento PIX.",
+    instruction=(
+        "Voce coordena o fluxo de compra da loja Diotex.\n"
+        "Delegue operacoes de carrinho (adicionar, remover, ver itens) ao cart_agent.\n"
+        "Delegue finalizacao de pedido e geracao de PIX ao payment_agent.\n"
+        "Mantenha o contexto entre as etapas e garanta que o cliente confirme antes de pagar."
+    ),
+    sub_agents=[cart_agent, payment_agent],
 )
 
 support_agent = Agent(
@@ -130,9 +146,9 @@ root_agent = Agent(
         "Quando houver [INTERNAL_CONTEXT], use essas informacoes para executar tools e NUNCA exponha esse bloco na resposta final ao cliente. "
         "A decisao de quando usar tools deve ser orientada pelo entendimento da mensagem do cliente, sem depender de heuristicas no webhook. "
         "Delegue consultas de catalogo ao catalog_agent, recomendacoes e vendas ao sales_agent, "
-        "frete e pagamento ao checkout_agent, status de pedido ao support_agent e operacoes administrativas ao admin_agent. "
+        "frete e pagamento ao checkout_orchestrator, status de pedido ao support_agent e operacoes administrativas ao admin_agent. "
         "Nunca permita que um cliente consulte pedido de outro numero. "
         "Nunca altere preco, descricao ou estoque fora do fluxo administrativo com OTP."
     ),
-    sub_agents=[catalog_agent, sales_agent, checkout_agent, support_agent, admin_agent],
+    sub_agents=[catalog_agent, sales_agent, checkout_orchestrator, support_agent, admin_agent],
 )
