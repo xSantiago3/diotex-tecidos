@@ -2,8 +2,19 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.models import Inventory, Product, ProductImage
 from app.schemas import CatalogListResponse, CatalogProductResponse
+
+
+settings = get_settings()
+
+
+def _build_product_url(slug: str | None) -> str | None:
+    if not settings.woocommerce_base_url or not slug:
+        return None
+    base = settings.woocommerce_base_url.rstrip("/")
+    return f"{base}/produto/{slug}/"
 
 
 def list_catalog_products(session: Session, search: str | None = None, limit: int = 50, offset: int = 0) -> CatalogListResponse:
@@ -36,6 +47,7 @@ def list_catalog_products(session: Session, search: str | None = None, limit: in
                 unit_type=product.unit_type,
                 categories=product.categories,
                 tags=product.tags,
+                product_url=_build_product_url(product.slug),
                 image_urls=[image.source_url for image in image_rows if image.source_url],
             )
         )

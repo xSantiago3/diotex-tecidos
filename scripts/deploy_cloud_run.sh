@@ -7,7 +7,7 @@ SERVICE_NAME="${SERVICE_NAME:-diotex-tecidos-api}"
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest"
 
 echo "Building image ${IMAGE}"
-gcloud builds submit --tag "${IMAGE}" .
+gcloud builds submit --project "${PROJECT_ID}" --tag "${IMAGE}" .
 
 echo "Deploying ${SERVICE_NAME} to Cloud Run in ${REGION}"
 gcloud run deploy "${SERVICE_NAME}" \

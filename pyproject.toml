@@ -5,6 +5,7 @@ description = "Multi-agent backend for Diotex Tecidos using Google ADK and FastA
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
+    "firebase-admin>=6.0.0",
     "google-adk>=1.8.0",
     "httpx>=0.28.0",
     "psycopg[binary]>=3.2.0",

@@ -5,8 +5,10 @@ from datetime import datetime
 from fastapi import HTTPException, status
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.models import Customer, Order, OrderItem, OrderStatus, Product
 from app.repositories import get_customer_by_phone, upsert_customer
+from app.firestore_db import create_order_firestore, add_order_item_firestore
 from app.schemas import (
     CheckoutItemRequest,
     CheckoutItemResponse,
@@ -93,6 +95,7 @@ def _load_cart_items(session: Session, items: list[CheckoutItemRequest]) -> tupl
 
 
 async def create_checkout_quote(session: Session, payload: CheckoutQuoteRequest) -> CheckoutQuoteResponse:
+    settings = get_settings()
     normalized_phone = normalize_phone(payload.whatsapp_phone)
     customer = _resolve_customer(session, payload)
     effective_zipcode = _get_effective_zipcode(customer, payload)
@@ -134,6 +137,53 @@ async def create_checkout_quote(session: Session, payload: CheckoutQuoteRequest)
     shipping_amount = round(selected_option.price, 2)
     total_amount = round(subtotal_amount + shipping_amount, 2)
 
+    # Tenta usar Firestore se habilitado
+    if settings.firestore_enabled:
+        try:
+            order_id = await create_order_firestore(
+                customer_whatsapp=customer.whatsapp_phone,
+                customer_name=customer.name or "",
+                customer_email=customer.email or "",
+                channel=payload.channel,
+                shipping_zipcode=effective_zipcode,
+                shipping_quote_json=selected_option.model_dump(),
+                subtotal_amount=subtotal_amount,
+                shipping_amount=shipping_amount,
+                total_amount=total_amount,
+                status="draft",
+            )
+
+            # Adiciona items do pedido
+            for item in response_items:
+                await add_order_item_firestore(
+                    order_id=order_id,
+                    product_id=item.product_id,
+                    product_name_snapshot=item.name,
+                    unit_price_snapshot=item.unit_price,
+                    quantity=item.quantity,
+                    line_total=item.line_total,
+                )
+
+            return CheckoutQuoteResponse(
+                requires_zipcode=False,
+                customer_whatsapp_phone=normalized_phone,
+                zipcode_used=effective_zipcode,
+                order_id=order_id,
+                provider=selected_option.provider,
+                carrier_name=selected_option.carrier_name,
+                service_name=selected_option.service_name,
+                shipping_amount=shipping_amount,
+                subtotal_amount=subtotal_amount,
+                total_amount=total_amount,
+                delivery_days_with_preparation=selected_option.delivery_days_with_preparation,
+                items=response_items,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Falha ao criar order via Firestore, fallback para SQLAlchemy: %s", exc)
+            # Continua com SQLAlchemy
+
+    # Fallback para SQLAlchemy
     order = Order(
         customer_id=customer.id or 0,
         channel=payload.channel,

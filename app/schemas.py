@@ -58,7 +58,10 @@ class AdminOtpResponse(BaseModel):
 
 
 class WhatsAppWebhookPayload(BaseModel):
-    payload: dict[str, Any]
+    model_config = {"extra": "allow"}
+
+    object: str | None = None
+    entry: list[dict[str, Any]] = []
 
 
 class CatalogProductResponse(BaseModel):
@@ -71,6 +74,7 @@ class CatalogProductResponse(BaseModel):
     unit_type: str
     categories: str | None = None
     tags: str | None = None
+    product_url: str | None = None
     image_urls: list[str] = []
 
 

@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine
@@ -10,6 +11,15 @@ settings = get_settings()
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, echo=False, connect_args=connect_args)
 _db_initialized = False
+
+# Firestore init
+if settings.firestore_enabled:
+    try:
+        from app.firestore_db import init_firestore
+        init_firestore()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Firestore init falhou: %s", e)
 
 
 def _ensure_sqlite_schema_updates() -> None:
@@ -54,6 +64,14 @@ def init_db() -> None:
 
 
 def get_session() -> Iterator[Session]:
+    init_db()
+    with Session(engine) as session:
+        yield session
+
+
+@contextmanager
+def get_db_session() -> Iterator[Session]:
+    """Context manager para uso direto fora do FastAPI (ex: tools dos agentes)."""
     init_db()
     with Session(engine) as session:
         yield session

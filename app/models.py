@@ -24,6 +24,7 @@ class Customer(SQLModel, table=True):
     name: str | None = None
     email: str | None = None
     zipcode: str | None = Field(default=None, index=True)
+    address_number: str | None = None  # número da casa/comercio
     preferred_language: str = Field(default="pt-BR")
     is_admin: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
@@ -85,6 +86,10 @@ class Order(SQLModel, table=True):
     payment_provider: str | None = None
     payment_reference: str | None = Field(default=None, index=True)
     status: OrderStatus = Field(default=OrderStatus.draft)
+    # Melhor Envio
+    me_shipment_id: str | None = Field(default=None, index=True)
+    tracking_code: str | None = None
+    label_url: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
@@ -108,6 +113,26 @@ class AdminAction(SQLModel, table=True):
     payload_before_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     payload_after_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     otp_verified_at: datetime | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+
+class Cart(SQLModel, table=True):
+    """Carrinho persistente por cliente. Um cliente tem no máximo um carrinho aberto."""
+    id: int | None = Field(default=None, primary_key=True)
+    customer_id: int = Field(index=True, foreign_key="customer.id")
+    status: str = Field(default="open")  # open | closed
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+
+class CartItem(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    cart_id: int = Field(index=True, foreign_key="cart.id")
+    product_id: int = Field(foreign_key="product.id")
+    product_name_snapshot: str
+    unit_price_snapshot: float
+    quantity: float
+    line_total: float
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
 
