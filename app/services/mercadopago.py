@@ -129,3 +129,79 @@ async def get_payment(payment_id: int | str) -> dict[str, Any]:
         )
         resp.raise_for_status()
         return resp.json()
+
+
+async def create_payment_link(
+    order_id: int,
+    total_amount: float,
+    customer_name: str,
+    customer_email: str,
+    description: str = "Pedido Diotex Tecidos",
+) -> dict[str, Any]:
+    """Cria um link de pagamento do Mercado Pago (Checkout Pro)."""
+    settings = get_settings()
+    if not settings.mercadopago_access_token:
+        return {"error": "MERCADOPAGO_ACCESS_TOKEN nao configurado."}
+
+    body = {
+        "items": [
+            {
+                "title": description,
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": round(float(total_amount), 2),
+            }
+        ],
+        "payer": {
+            "name": customer_name or "Cliente",
+            "email": customer_email or "comprador@diotextecidos.com.br",
+        },
+        "external_reference": str(order_id),
+        "notification_url": "https://diotex-tecidos-api-298996329023.us-central1.run.app/webhooks/mercadopago",
+        "statement_descriptor": "DIOTEXT",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            resp = await client.post(f"{_MP_BASE}/checkout/preferences", json=body, headers=_headers())
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            response_body = exc.response.text[:2000] if exc.response is not None else None
+            log.error(
+                "Mercado Pago retornou erro HTTP ao criar link de pagamento",
+                extra={
+                    "event": "mercadopago_create_link_http_error",
+                    "order_id": order_id,
+                    "status_code": exc.response.status_code if exc.response is not None else None,
+                    "response_body": response_body,
+                },
+            )
+            return {
+                "error": (
+                    f"Mercado Pago HTTP {exc.response.status_code if exc.response is not None else 'unknown'}"
+                )
+            }
+        except httpx.RequestError as exc:
+            log.error(
+                "Falha de rede ao criar link de pagamento no Mercado Pago",
+                extra={
+                    "event": "mercadopago_create_link_network_error",
+                    "order_id": order_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return {"error": f"Falha de rede Mercado Pago: {exc}"}
+        except Exception as exc:
+            log.exception(
+                "Erro inesperado ao criar link de pagamento no Mercado Pago",
+                extra={"event": "mercadopago_create_link_unexpected_error", "order_id": order_id},
+            )
+            return {"error": f"Erro inesperado Mercado Pago: {exc}"}
+
+    return {
+        "preference_id": data.get("id"),
+        "payment_link": data.get("init_point") or data.get("sandbox_init_point"),
+        "sandbox_payment_link": data.get("sandbox_init_point"),
+    }

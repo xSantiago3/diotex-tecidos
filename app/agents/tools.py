@@ -1,11 +1,9 @@
 """ADK tools that agents can call to interact with the Diotex backend."""
 from __future__ import annotations
 
-import asyncio
-import logging
 from difflib import SequenceMatcher
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 import unicodedata
 
 import httpx
@@ -24,7 +22,6 @@ from app.services.whatsapp import send_whatsapp_image, send_whatsapp_message
 from app.utils.phones import normalize_phone
 
 settings = get_settings()
-log = logging.getLogger(__name__)
 
 _BASE = "http://localhost:8080"
 
@@ -649,31 +646,182 @@ def remove_from_cart(whatsapp_phone: str, product_id: int, tool_context: ToolCon
         return {"error": str(exc)}
 
 
-async def confirm_and_generate_pix(
+def _build_open_cart_checkout_snapshot(
     whatsapp_phone: str,
+    zipcode: str,
+    customer_name: str,
+    customer_email: str,
     address_number: str,
+) -> dict[str, Any]:
+    with get_db_session() as session:
+        customer = upsert_customer(session, CustomerUpsert(
+            whatsapp_phone=whatsapp_phone,
+            name=customer_name or None,
+            email=customer_email or None,
+            zipcode=zipcode or None,
+        ))
+        if address_number:
+            customer.address_number = address_number
+            session.add(customer)
+            session.commit()
+            session.refresh(customer)
+
+        cart = session.exec(
+            select(Cart).where(Cart.customer_id == customer.id, Cart.status == "open")
+        ).first()
+        if not cart:
+            return {"error": "Carrinho vazio. Adicione produtos antes de fechar o pedido."}
+
+        cart_items = session.exec(select(CartItem).where(CartItem.cart_id == cart.id)).all()
+        if not cart_items:
+            return {"error": "Carrinho vazio."}
+
+        subtotal = round(sum(i.line_total for i in cart_items), 2)
+
+        products: list[Product] = []
+        for ci in cart_items:
+            product = session.get(Product, ci.product_id)
+            if not product:
+                return {"error": f"Produto {ci.product_id} nao encontrado no catalogo."}
+            products.append(product)
+
+        total_weight_g = 0.0
+        max_length_cm = 0.0
+        max_width_cm = 0.0
+        total_height_cm = 0.0
+        for product, ci in zip(products, cart_items):
+            if not all([
+                product.weight_g,
+                product.package_length_cm,
+                product.package_width_cm,
+                product.package_height_cm,
+            ]):
+                return {"error": f"Produto sem peso/dimensoes cadastrados: {product.name}"}
+            total_weight_g += (product.weight_g or 0.0) * ci.quantity
+            max_length_cm = max(max_length_cm, product.package_length_cm or 0.0)
+            max_width_cm = max(max_width_cm, product.package_width_cm or 0.0)
+            total_height_cm += (product.package_height_cm or 0.0) * ci.quantity
+
+        cart_items_data = [
+            {
+                "product_id": ci.product_id,
+                "product_name_snapshot": ci.product_name_snapshot,
+                "unit_price_snapshot": ci.unit_price_snapshot,
+                "quantity": ci.quantity,
+                "line_total": ci.line_total,
+            }
+            for ci in cart_items
+        ]
+
+        return {
+            "customer_id": customer.id,
+            "cart_id": cart.id,
+            "subtotal": subtotal,
+            "cart_items_data": cart_items_data,
+            "weight_g": total_weight_g,
+            "length_cm": max_length_cm,
+            "width_cm": max_width_cm,
+            "height_cm": max(total_height_cm, 1.0),
+        }
+
+
+async def prepare_checkout_options(
+    whatsapp_phone: str,
+    zipcode: str,
     tool_context: ToolContext,
+    address_number: str = "",
+    customer_name: str = "",
+    customer_email: str = "",
+) -> dict[str, Any]:
+    """Calcula fretes do Melhor Envio e apresenta opções para o cliente escolher.
+
+    Esta tool deve ser chamada antes de fechar o pedido e antes de definir o método
+    de pagamento. O agente deve mostrar as opções e pedir que o cliente escolha.
+    """
+    from app.schemas import ShippingProvider, ShippingQuoteRequest
+
+    zipcode = zipcode or tool_context.state.get("shipping_cep", "")
+    customer_name = customer_name or tool_context.state.get("customer_name", "")
+    customer_email = customer_email or tool_context.state.get("customer_email", "")
+
+    if not zipcode:
+        return {"error": "CEP de entrega nao informado."}
+
+    snapshot = _build_open_cart_checkout_snapshot(
+        whatsapp_phone=whatsapp_phone,
+        zipcode=zipcode,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        address_number=address_number,
+    )
+    if snapshot.get("error"):
+        return snapshot
+
+    shipping_resp = await calculate_shipping_quote(ShippingQuoteRequest(
+        provider=ShippingProvider.melhor_envio,
+        to_zipcode=zipcode,
+        product_name="Carrinho Diotex",
+        quantity=1,
+        unit_price=snapshot["subtotal"],
+        weight_g=snapshot["weight_g"],
+        package_length_cm=snapshot["length_cm"],
+        package_width_cm=snapshot["width_cm"],
+        package_height_cm=snapshot["height_cm"],
+        insurance_value=snapshot["subtotal"],
+    ))
+    if not shipping_resp.options:
+        return {"error": "Nao foi possivel obter opcoes de envio para este CEP."}
+
+    options = [opt.model_dump() for opt in shipping_resp.options]
+    previews = []
+    for idx, opt in enumerate(shipping_resp.options):
+        previews.append({
+            "option_index": idx,
+            "carrier": opt.carrier_name,
+            "service_name": opt.service_name,
+            "service_code": opt.service_code,
+            "shipping_amount": round(opt.price, 2),
+            "delivery_days": opt.delivery_days,
+            "delivery_days_with_preparation": opt.delivery_days_with_preparation,
+            "total_amount": round(snapshot["subtotal"] + opt.price, 2),
+        })
+
+    tool_context.state["customer_phone"] = whatsapp_phone
+    tool_context.state["shipping_cep"] = zipcode
+    tool_context.state["customer_name"] = customer_name
+    tool_context.state["customer_email"] = customer_email
+    tool_context.state["checkout_shipping_options"] = options
+    tool_context.state["checkout_cart_snapshot"] = snapshot
+
+    return {
+        "subtotal": snapshot["subtotal"],
+        "shipping_options": previews,
+        "message": "Mostre as opcoes ao cliente e peca para escolher o option_index desejado.",
+    }
+
+
+async def finalize_checkout_payment(
+    whatsapp_phone: str,
+    payment_method: Literal["pix", "mercado_pago"],
+    shipping_option_index: int,
+    tool_context: ToolContext,
+    address_number: str = "",
     zipcode: str = "",
     customer_name: str = "",
     customer_email: str = "",
 ) -> dict[str, Any]:
-    """Fecha o carrinho, cria o pedido e gera o código PIX para pagamento.
+    """Fecha o pedido após escolha do frete e método de pagamento.
 
-    Chamar esta tool APENAS quando o cliente disser explicitamente que quer fechar/pagar.
-    Os campos zipcode, customer_name e customer_email podem ser omitidos se já foram
-    informados anteriormente na conversa (serão recuperados do estado da sessão).
+    Fluxo esperado:
+    1. Chamar prepare_checkout_options
+    2. Cliente escolhe envio (option_index)
+    3. Chamar esta tool com payment_method=\"pix\" ou \"mercado_pago\"
 
-    Args:
-        whatsapp_phone: Número do WhatsApp do cliente.
-        address_number: Número da casa ou comércio para entrega.
-        zipcode: CEP de entrega (usa o da sessão se omitido).
-        customer_name: Nome completo do cliente (usa o da sessão se omitido).
-        customer_email: E-mail do cliente (necessário para gerar PIX no MP).
-
-    Returns:
-        Código PIX copia-e-cola, valor total e ID do pedido.
+    - pix: retorna chave PIX e valor (sem QR do Mercado Pago)
+    - mercado_pago: cria link de pagamento e envia por WhatsApp ao cliente
     """
-    # Recupera dados do estado da sessão como fallback
+    from app.services.mercadopago import create_payment_link
+
     zipcode = zipcode or tool_context.state.get("shipping_cep", "")
     customer_name = customer_name or tool_context.state.get("customer_name", "")
     customer_email = customer_email or tool_context.state.get("customer_email", "")
@@ -682,235 +830,173 @@ async def confirm_and_generate_pix(
         return {"error": "CEP de entrega nao informado."}
     if not customer_name:
         return {"error": "Nome do cliente nao informado."}
-    if not customer_email:
-        return {"error": "E-mail do cliente nao informado."}
+    if payment_method == "mercado_pago" and not customer_email:
+        return {"error": "E-mail do cliente nao informado para Mercado Pago."}
 
-    # Persiste na sessão para uso futuro
-    tool_context.state["customer_name"] = customer_name
-    tool_context.state["customer_email"] = customer_email
-    tool_context.state["shipping_cep"] = zipcode
+    options = tool_context.state.get("checkout_shipping_options")
+    snapshot = tool_context.state.get("checkout_cart_snapshot")
+    if not isinstance(options, list) or not options:
+        return {"error": "Primeiro chame prepare_checkout_options para carregar opcoes de envio."}
+    if not isinstance(snapshot, dict) or not snapshot.get("cart_items_data"):
+        return {"error": "Contexto do carrinho ausente. Chame prepare_checkout_options novamente."}
+    if shipping_option_index < 0 or shipping_option_index >= len(options):
+        return {"error": f"shipping_option_index invalido. Escolha entre 0 e {len(options)-1}."}
 
-    from app.services.shipping import calculate_shipping_quote
-    from app.schemas import ShippingProvider, ShippingQuoteRequest
-    from app.services.mercadopago import create_pix_payment
+    selected_shipping = options[shipping_option_index]
+    shipping_amount = round(float(selected_shipping.get("price", 0.0)), 2)
+    subtotal = round(float(snapshot.get("subtotal", 0.0)), 2)
+    total_amount = round(subtotal + shipping_amount, 2)
 
-    async def _retry_async(op_name: str, fn, attempts: int = 3) -> Any:
-        last_exc: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return await fn()
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if attempt < attempts:
-                    await asyncio.sleep(0.7 * attempt)
-        if last_exc is not None:
-            raise RuntimeError(f"{op_name} falhou apos {attempts} tentativas: {last_exc}") from last_exc
-        raise RuntimeError(f"{op_name} falhou apos {attempts} tentativas")
+    # Revalida carrinho aberto e dados atuais antes de fechar
+    fresh_snapshot = _build_open_cart_checkout_snapshot(
+        whatsapp_phone=whatsapp_phone,
+        zipcode=zipcode,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        address_number=address_number,
+    )
+    if fresh_snapshot.get("error"):
+        return fresh_snapshot
 
-    async def _notify_admin_failure(stage: str, reason: str, order_id: int | None = None) -> None:
-        log.error(
-            "Falha no checkout automatizado",
-            extra={
-                "event": "checkout_automation_failed",
-                "stage": stage,
-                "reason": reason,
-                "order_id": order_id,
-                "customer_phone": whatsapp_phone,
-                "zipcode": zipcode,
-            },
+    with get_db_session() as session:
+        order_status = OrderStatus.payment_under_review if payment_method == "pix" else OrderStatus.awaiting_payment
+        order = Order(
+            customer_id=fresh_snapshot["customer_id"],
+            channel="whatsapp",
+            shipping_zipcode=zipcode,
+            subtotal_amount=subtotal,
+            shipping_amount=shipping_amount,
+            total_amount=total_amount,
+            status=order_status,
+            payment_provider="pix_manual" if payment_method == "pix" else "mercadopago",
+            shipping_quote_json=selected_shipping,
         )
-        msg = (
-            "⚠️ *Falha no checkout automatizado*\n"
-            f"Etapa: {stage}\n"
-            f"Cliente: {customer_name}\n"
-            f"WhatsApp: {whatsapp_phone}\n"
-            f"CEP: {zipcode}\n"
-            f"Pedido: {order_id if order_id else '-'}\n"
-            f"Motivo: {reason}\n"
-            "\nAção recomendada: entrar em contato com o cliente para concluir manualmente."
-        )
-        try:
-            await send_whatsapp_message(to_phone=settings.notification_phone, text=msg)
-        except Exception:
-            # Não interrompe o fluxo caso a notificação do admin também falhe.
-            pass
+        session.add(order)
+        session.commit()
+        session.refresh(order)
+        order_id = order.id
 
-    try:
-        with get_db_session() as session:
-            # Atualiza dados do cliente
-            customer = upsert_customer(session, CustomerUpsert(
-                whatsapp_phone=whatsapp_phone,
-                name=customer_name,
-                email=customer_email,
-                zipcode=zipcode,
-            ))
-            customer.address_number = address_number
-            session.add(customer)
-            session.commit()
-            session.refresh(customer)
-
-            # Pega carrinho aberto
-            cart = session.exec(
-                select(Cart).where(Cart.customer_id == customer.id, Cart.status == "open")
-            ).first()
-            if not cart:
-                return {"error": "Carrinho vazio. Adicione produtos antes de fechar o pedido."}
-
-            cart_items = session.exec(select(CartItem).where(CartItem.cart_id == cart.id)).all()
-            if not cart_items:
-                return {"error": "Carrinho vazio."}
-
-            subtotal = round(sum(i.line_total for i in cart_items), 2)
-
-            # Usa peso/dimensões do primeiro produto como base (simplificado)
-            first_product = session.get(Product, cart_items[0].product_id)
-            # Snapshot dos dados para usar fora do context manager
-            cart_items_data = [
-                {
-                    "product_id": ci.product_id,
-                    "product_name_snapshot": ci.product_name_snapshot,
-                    "unit_price_snapshot": ci.unit_price_snapshot,
-                    "quantity": ci.quantity,
-                    "line_total": ci.line_total,
-                }
-                for ci in cart_items
-            ]
-            weight_g = first_product.weight_g if first_product and first_product.weight_g else 500.0
-            length_cm = first_product.package_length_cm if first_product and first_product.package_length_cm else 30.0
-            width_cm = first_product.package_width_cm if first_product and first_product.package_width_cm else 20.0
-            height_cm = first_product.package_height_cm if first_product and first_product.package_height_cm else 5.0
-            customer_id = customer.id
-            cart_id = cart.id
-
-        # Calcula frete (fora do db session)
-        async def _shipping_call() -> Any:
-            return await calculate_shipping_quote(ShippingQuoteRequest(
-                provider=ShippingProvider.melhor_envio,
-                to_zipcode=zipcode,
-                product_name="Carrinho Diotex",
-                quantity=1,
-                unit_price=subtotal,
-                weight_g=weight_g,
-                package_length_cm=length_cm,
-                package_width_cm=width_cm,
-                package_height_cm=height_cm,
+        for ci in fresh_snapshot["cart_items_data"]:
+            session.add(OrderItem(
+                order_id=order_id,
+                product_id=ci["product_id"],
+                product_name_snapshot=ci["product_name_snapshot"],
+                unit_price_snapshot=ci["unit_price_snapshot"],
+                quantity=ci["quantity"],
+                line_total=ci["line_total"],
             ))
 
-        shipping_resp = await _retry_async("cotacao de frete", _shipping_call, attempts=3)
-        best_shipping = shipping_resp.options[0] if shipping_resp.options else None
-        if not best_shipping:
-            await _notify_admin_failure(
-                stage="cotacao_frete",
-                reason="Nao retornou opcoes de frete apos 3 tentativas.",
-            )
-            return {
-                "error": (
-                    "Nao consegui calcular o frete agora. Ja encaminhei seu atendimento para um especialista "
-                    "humano e vamos continuar por aqui em instantes."
-                )
-            }
-        shipping_amount = round(best_shipping.price if best_shipping else 0.0, 2)
-        total_amount = round(subtotal + shipping_amount, 2)
+        cart_db = session.get(Cart, fresh_snapshot["cart_id"])
+        if cart_db:
+            cart_db.status = "closed"
+            session.add(cart_db)
+        session.commit()
 
-        # Cria pedido e fecha carrinho
-        with get_db_session() as session:
-            order = Order(
-                customer_id=customer_id,
-                channel="whatsapp",
-                shipping_zipcode=zipcode,
-                subtotal_amount=subtotal,
-                shipping_amount=shipping_amount,
-                total_amount=total_amount,
-                status=OrderStatus.awaiting_payment,
-                payment_provider="mercadopago",
-                shipping_quote_json=best_shipping.model_dump() if best_shipping else None,
-            )
-            session.add(order)
-            session.commit()
-            session.refresh(order)
-            order_id = order.id
+    tool_context.state["last_order_id"] = order_id
 
-            for ci in cart_items_data:
-                session.add(OrderItem(
-                    order_id=order_id,
-                    product_id=ci["product_id"],
-                    product_name_snapshot=ci["product_name_snapshot"],
-                    unit_price_snapshot=ci["unit_price_snapshot"],
-                    quantity=ci["quantity"],
-                    line_total=ci["line_total"],
-                ))
-
-            # Fecha o carrinho
-            cart_db = session.get(Cart, cart_id)
-            if cart_db:
-                cart_db.status = "closed"
-                session.add(cart_db)
-            session.commit()
-
-        # Gera PIX no Mercado Pago
-        async def _pix_call() -> dict[str, Any]:
-            pix_result = await create_pix_payment(
-                order_id=order_id,
-                total_amount=total_amount,
-                customer_name=customer_name,
-                customer_email=customer_email,
-            )
-            if "error" in pix_result:
-                raise RuntimeError(str(pix_result["error"]))
-            return pix_result
-
-        try:
-            pix = await _retry_async("geracao PIX", _pix_call, attempts=3)
-        except Exception as pix_exc:  # noqa: BLE001
-            await _notify_admin_failure(
-                stage="geracao_pix",
-                reason=str(pix_exc),
-                order_id=order_id,
-            )
-            log.warning(
-                "PIX nao gerado apos tentativas, pedido ficou em contingencia",
-                extra={
-                    "event": "pix_generation_fallback",
-                    "order_id": order_id,
-                    "total_amount": total_amount,
-                    "shipping_amount": shipping_amount,
-                },
-            )
-            return {
-                "order_id": order_id,
-                "total_amount": total_amount,
-                "subtotal": subtotal,
-                "shipping_amount": shipping_amount,
-                "error": (
-                    "Seu pedido foi registrado, mas tivemos instabilidade ao gerar o PIX agora. "
-                    "Ja encaminhei seu atendimento para nosso administrador concluir com prioridade."
+    if payment_method == "pix":
+        pix_key = settings.pix_key or "PIX indisponivel"
+        if settings.pix_key:
+            await send_whatsapp_message(
+                to_phone=whatsapp_phone,
+                text=(
+                    f"Pagamento via PIX selecionado.\\n"
+                    f"Pedido #{order_id}\\n"
+                    f"Valor total: R${total_amount:.2f}\\n"
+                    f"Chave PIX: {pix_key}"
                 ),
-            }
+            )
 
-        # Salva referência do pagamento no pedido
-        with get_db_session() as session:
-            order_db = session.get(Order, order_id)
-            if order_db:
-                order_db.payment_reference = str(pix.get("payment_id"))
-                session.add(order_db)
-                session.commit()
-
+        _sync_post(f"/internal/orders/{order_id}/notify-pix-pending", {})
         return {
             "order_id": order_id,
-            "total_amount": total_amount,
+            "payment_method": "pix",
             "subtotal": subtotal,
             "shipping_amount": shipping_amount,
-            "shipping_carrier": best_shipping.carrier_name if best_shipping else None,
-            "pix_code": pix.get("qr_code"),
-            "payment_id": pix.get("payment_id"),
-            "expires_at": pix.get("expires_at"),
+            "total_amount": total_amount,
+            "pix_key": pix_key,
+            "shipping_selected": {
+                "carrier": selected_shipping.get("carrier_name"),
+                "service_name": selected_shipping.get("service_name"),
+                "delivery_days_with_preparation": selected_shipping.get("delivery_days_with_preparation"),
+            },
         }
-    except Exception as exc:
-        await _notify_admin_failure(stage="checkout_geral", reason=str(exc))
+
+    link_result = await create_payment_link(
+        order_id=order_id,
+        total_amount=total_amount,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        description=f"Pedido #{order_id} - Diotex Tecidos",
+    )
+    if link_result.get("error"):
         return {
-            "error": (
-                "Tive uma falha tecnica para concluir seu checkout agora. "
-                "Ja encaminhei seu atendimento para nosso administrador e vamos te retornar aqui."
-            )
+            "order_id": order_id,
+            "payment_method": "mercado_pago",
+            "subtotal": subtotal,
+            "shipping_amount": shipping_amount,
+            "total_amount": total_amount,
+            "error": f"Pedido criado, mas nao foi possivel gerar link MP: {link_result['error']}",
         }
+
+    payment_link = link_result.get("payment_link")
+    if payment_link:
+        await send_whatsapp_message(
+            to_phone=whatsapp_phone,
+            text=(
+                f"Pagamento via Mercado Pago selecionado.\\n"
+                f"Pedido #{order_id}\\n"
+                f"Valor total: R${total_amount:.2f}\\n"
+                f"Link para pagamento: {payment_link}"
+            ),
+        )
+
+    return {
+        "order_id": order_id,
+        "payment_method": "mercado_pago",
+        "subtotal": subtotal,
+        "shipping_amount": shipping_amount,
+        "total_amount": total_amount,
+        "payment_link": payment_link,
+        "shipping_selected": {
+            "carrier": selected_shipping.get("carrier_name"),
+            "service_name": selected_shipping.get("service_name"),
+            "delivery_days_with_preparation": selected_shipping.get("delivery_days_with_preparation"),
+        },
+    }
+
+
+async def confirm_and_generate_pix(
+    whatsapp_phone: str,
+    address_number: str,
+    tool_context: ToolContext,
+    zipcode: str = "",
+    customer_name: str = "",
+    customer_email: str = "",
+) -> dict[str, Any]:
+    """Compatibilidade retroativa: mantém assinatura antiga e usa PIX manual.
+
+    Preferir usar prepare_checkout_options + finalize_checkout_payment.
+    """
+    prep = await prepare_checkout_options(
+        whatsapp_phone=whatsapp_phone,
+        zipcode=zipcode,
+        tool_context=tool_context,
+        address_number=address_number,
+        customer_name=customer_name,
+        customer_email=customer_email,
+    )
+    if prep.get("error"):
+        return prep
+
+    return await finalize_checkout_payment(
+        whatsapp_phone=whatsapp_phone,
+        payment_method="pix",
+        shipping_option_index=0,
+        tool_context=tool_context,
+        address_number=address_number,
+        zipcode=zipcode,
+        customer_name=customer_name,
+        customer_email=customer_email,
+    )
 

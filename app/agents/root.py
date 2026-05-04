@@ -5,12 +5,11 @@ from google.adk.agents import Agent
 from app.config import get_settings
 from app.agents.tools import (
     add_to_cart,
-    confirm_and_generate_pix,
-    create_order_quote,
+    finalize_checkout_payment,
     get_order_status,
     list_my_orders,
     list_product_categories,
-    quote_shipping,
+    prepare_checkout_options,
     remove_from_cart,
     request_admin_otp,
     send_catalog_media,
@@ -77,24 +76,21 @@ cart_agent = Agent(
 payment_agent = Agent(
     name="payment_agent",
     model=settings.default_model,
-    description="Calcula frete, gera cotacao de pedido e processa pagamento PIX.",
+    description="Apresenta opcoes de envio e finaliza pagamento (PIX ou Mercado Pago).",
     instruction=(
-        "Voce finaliza o pedido e gera o pagamento PIX da loja Diotex.\n"
-        "IMPORTANTE: CEP, nome e e-mail do cliente podem ja estar gravados no estado da sessao "
-        "de interacoes anteriores — so pergunte o que ainda nao foi informado.\n"
-        "FLUXO antes de gerar o PIX — colete os dados abaixo se ainda nao tiver:\n"
-        "1. CEP de entrega (verifique o estado da sessao primeiro).\n"
-        "2. Numero da casa ou comercio.\n"
-        "3. Nome completo do cliente.\n"
-        "4. E-mail do cliente.\n"
-        "Use view_cart para confirmar o conteudo do carrinho antes de fechar.\n"
-        "Use quote_shipping para simular o frete se o cliente quiser saber o valor antes de confirmar.\n"
-        "Use create_order_quote para gerar uma pre-visualizacao completa (subtotal + frete + total).\n"
-        "Use confirm_and_generate_pix APENAS quando o cliente confirmar explicitamente que quer pagar.\n"
-        "Apresente o codigo PIX copia-e-cola, o valor total e o prazo estimado de entrega.\n"
-        "NUNCA gere o PIX sem confirmacao explicita do cliente."
+        "Voce finaliza o pedido da loja Diotex com um fluxo obrigatorio em etapas.\n"
+        "ETAPA 1: confirme o carrinho com view_cart.\n"
+        "ETAPA 2: colete CEP e chame prepare_checkout_options para calcular fretes do Melhor Envio.\n"
+        "ETAPA 3: mostre TODAS as opcoes de envio com transportadora, valor e prazo estimado (incluindo preparacao).\n"
+        "ETAPA 4: pergunte qual opcao de envio o cliente escolhe (option_index).\n"
+        "ETAPA 5: pergunte o metodo de pagamento: PIX ou Mercado Pago.\n"
+        "ETAPA 6: chame finalize_checkout_payment com o option_index escolhido e o payment_method escolhido.\n"
+        "REGRAS:\n"
+        "- Para PIX: informar chave PIX e valor total.\n"
+        "- Para Mercado Pago: gerar link e enviar por WhatsApp. Nao enviar por e-mail.\n"
+        "- NUNCA finalize pedido sem o cliente escolher envio e metodo de pagamento explicitamente."
     ),
-    tools=[view_cart, quote_shipping, create_order_quote, confirm_and_generate_pix],
+    tools=[view_cart, prepare_checkout_options, finalize_checkout_payment],
 )
 
 checkout_orchestrator = Agent(
