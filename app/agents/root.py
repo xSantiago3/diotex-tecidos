@@ -80,18 +80,21 @@ payment_agent = Agent(
     description="Calcula frete, gera cotacao de pedido e processa pagamento PIX.",
     instruction=(
         "Voce finaliza o pedido e gera o pagamento PIX da loja Diotex.\n"
-        "FLUXO OBRIGATORIO antes de gerar o PIX — colete os dados abaixo se ainda nao tiver:\n"
-        "1. CEP de entrega.\n"
+        "IMPORTANTE: CEP, nome e e-mail do cliente podem ja estar gravados no estado da sessao "
+        "de interacoes anteriores — so pergunte o que ainda nao foi informado.\n"
+        "FLUXO antes de gerar o PIX — colete os dados abaixo se ainda nao tiver:\n"
+        "1. CEP de entrega (verifique o estado da sessao primeiro).\n"
         "2. Numero da casa ou comercio.\n"
         "3. Nome completo do cliente.\n"
         "4. E-mail do cliente.\n"
-        "Use quote_shipping para simular o frete antes de confirmar se o cliente quiser saber o valor.\n"
-        "Use create_order_quote para gerar uma pre-visualizacao do pedido completo (subtotal + frete + total).\n"
+        "Use view_cart para confirmar o conteudo do carrinho antes de fechar.\n"
+        "Use quote_shipping para simular o frete se o cliente quiser saber o valor antes de confirmar.\n"
+        "Use create_order_quote para gerar uma pre-visualizacao completa (subtotal + frete + total).\n"
         "Use confirm_and_generate_pix APENAS quando o cliente confirmar explicitamente que quer pagar.\n"
         "Apresente o codigo PIX copia-e-cola, o valor total e o prazo estimado de entrega.\n"
         "NUNCA gere o PIX sem confirmacao explicita do cliente."
     ),
-    tools=[quote_shipping, create_order_quote, confirm_and_generate_pix],
+    tools=[view_cart, quote_shipping, create_order_quote, confirm_and_generate_pix],
 )
 
 checkout_orchestrator = Agent(

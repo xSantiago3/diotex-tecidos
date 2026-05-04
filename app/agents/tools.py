@@ -8,6 +8,7 @@ from typing import Any
 import unicodedata
 
 import httpx
+from google.adk.tools import ToolContext
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -265,6 +266,7 @@ async def send_catalog_media(
 async def quote_shipping(
     to_zipcode: str,
     product_name: str,
+    tool_context: ToolContext,
     quantity: float = 1.0,
     unit_price: float = 10.0,
     weight_g: float = 300.0,
@@ -300,6 +302,8 @@ async def quote_shipping(
             package_height_cm=package_height_cm,
         )
         result = await calculate_shipping_quote(req)
+        # Persiste o CEP na sessão para o payment_agent reutilizar
+        tool_context.state["shipping_cep"] = to_zipcode
         return {"options": [o.model_dump() for o in result.options]}
     except Exception as exc:
         return {"error": str(exc)}
@@ -529,7 +533,7 @@ def _cart_summary(session: Session, cart: Cart) -> dict[str, Any]:
     }
 
 
-def add_to_cart(whatsapp_phone: str, product_id: int, quantity: float) -> dict[str, Any]:
+def add_to_cart(whatsapp_phone: str, product_id: int, quantity: float, tool_context: ToolContext) -> dict[str, Any]:
     """Adiciona um produto ao carrinho do cliente.
 
     Após adicionar, retorna o resumo completo do carrinho para mostrar ao cliente.
@@ -575,12 +579,17 @@ def add_to_cart(whatsapp_phone: str, product_id: int, quantity: float) -> dict[s
             session.add(cart)
             session.commit()
             session.refresh(cart)
-            return _cart_summary(session, cart)
+            summary = _cart_summary(session, cart)
+
+        # Persiste dados relevantes na sessão ADK
+        tool_context.state["customer_phone"] = whatsapp_phone
+        tool_context.state["cart_summary"] = summary
+        return summary
     except Exception as exc:
         return {"error": str(exc)}
 
 
-def view_cart(whatsapp_phone: str) -> dict[str, Any]:
+def view_cart(whatsapp_phone: str, tool_context: ToolContext) -> dict[str, Any]:
     """Retorna o conteúdo atual do carrinho do cliente.
 
     Args:
@@ -597,12 +606,16 @@ def view_cart(whatsapp_phone: str) -> dict[str, Any]:
             ).first()
             if not cart:
                 return {"cart_id": None, "items": [], "subtotal": 0.0, "item_count": 0}
-            return _cart_summary(session, cart)
+            summary = _cart_summary(session, cart)
+
+        tool_context.state["customer_phone"] = whatsapp_phone
+        tool_context.state["cart_summary"] = summary
+        return summary
     except Exception as exc:
         return {"error": str(exc)}
 
 
-def remove_from_cart(whatsapp_phone: str, product_id: int) -> dict[str, Any]:
+def remove_from_cart(whatsapp_phone: str, product_id: int, tool_context: ToolContext) -> dict[str, Any]:
     """Remove um produto do carrinho do cliente.
 
     Args:
@@ -626,32 +639,55 @@ def remove_from_cart(whatsapp_phone: str, product_id: int) -> dict[str, Any]:
             if item:
                 session.delete(item)
                 session.commit()
-            return _cart_summary(session, cart)
+            summary = _cart_summary(session, cart)
+
+        tool_context.state["cart_summary"] = summary
+        return summary
     except Exception as exc:
         return {"error": str(exc)}
 
 
 async def confirm_and_generate_pix(
     whatsapp_phone: str,
-    zipcode: str,
     address_number: str,
-    customer_name: str,
-    customer_email: str,
+    tool_context: ToolContext,
+    zipcode: str = "",
+    customer_name: str = "",
+    customer_email: str = "",
 ) -> dict[str, Any]:
     """Fecha o carrinho, cria o pedido e gera o código PIX para pagamento.
 
     Chamar esta tool APENAS quando o cliente disser explicitamente que quer fechar/pagar.
+    Os campos zipcode, customer_name e customer_email podem ser omitidos se já foram
+    informados anteriormente na conversa (serão recuperados do estado da sessão).
 
     Args:
         whatsapp_phone: Número do WhatsApp do cliente.
-        zipcode: CEP de entrega.
         address_number: Número da casa ou comércio para entrega.
-        customer_name: Nome completo do cliente.
+        zipcode: CEP de entrega (usa o da sessão se omitido).
+        customer_name: Nome completo do cliente (usa o da sessão se omitido).
         customer_email: E-mail do cliente (necessário para gerar PIX no MP).
 
     Returns:
         Código PIX copia-e-cola, valor total e ID do pedido.
     """
+    # Recupera dados do estado da sessão como fallback
+    zipcode = zipcode or tool_context.state.get("shipping_cep", "")
+    customer_name = customer_name or tool_context.state.get("customer_name", "")
+    customer_email = customer_email or tool_context.state.get("customer_email", "")
+
+    if not zipcode:
+        return {"error": "CEP de entrega nao informado."}
+    if not customer_name:
+        return {"error": "Nome do cliente nao informado."}
+    if not customer_email:
+        return {"error": "E-mail do cliente nao informado."}
+
+    # Persiste na sessão para uso futuro
+    tool_context.state["customer_name"] = customer_name
+    tool_context.state["customer_email"] = customer_email
+    tool_context.state["shipping_cep"] = zipcode
+
     from app.services.shipping import calculate_shipping_quote
     from app.schemas import ShippingProvider, ShippingQuoteRequest
     from app.services.mercadopago import create_pix_payment
