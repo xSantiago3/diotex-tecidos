@@ -6,8 +6,12 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService, VertexAiSessionService
 from google.genai import types
 
+from app.logging_config import configure_logging
 from app.agents.root import root_agent
 from app.config import get_settings
+
+
+configure_logging()
 
 
 settings = get_settings()

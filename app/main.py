@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 import time
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from sqlmodel import Session
+
+from app.logging_config import configure_logging
+
+configure_logging()
 
 from app.config import get_settings
 from app.db import get_session, init_db
@@ -54,6 +59,7 @@ from app.services.woocommerce import sync_products_from_woocommerce
 
 
 settings = get_settings()
+log = logging.getLogger(__name__)
 SessionDep = Annotated[Session, Depends(get_session)]
 _processed_message_ids: dict[str, float] = {}
 _MESSAGE_DEDUP_TTL_SECONDS = 300.0
@@ -77,8 +83,6 @@ async def _send_separation_template_to_admins(
     tracking_code: str | None = None,
 ) -> None:
     """Envia template 'separar_pedido' para todos os admins após pagamento aprovado."""
-    import logging
-    log = logging.getLogger(__name__)
     products_list = ", ".join(
         f"{i.product_name_snapshot} ({i.quantity}m)" for i in items
     )
@@ -111,8 +115,6 @@ async def _send_pix_review_to_admins(
     items: list[Any],
 ) -> None:
     """Envia template 'avaliar_pagamento_pix' (com botões confirmar/rejeitar) para admins."""
-    import logging
-    log = logging.getLogger(__name__)
     products_list = ", ".join(
         f"{i.product_name_snapshot} ({i.quantity}m)" for i in items
     )
@@ -135,11 +137,9 @@ async def _send_pix_review_to_admins(
 
 async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Session) -> None:
     """Processa resposta de botão de admin para confirmar ou rejeitar pagamento PIX."""
-    import logging
     from sqlmodel import select as sql_select
     from app.models import Order, OrderItem, OrderStatus, Customer
 
-    log = logging.getLogger(__name__)
     admin_phone = button_reply.get("from_phone")
     button_id = button_reply.get("button_id")
 
@@ -272,8 +272,6 @@ async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Sess
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    import logging
-    _log = logging.getLogger(__name__)
     init_db()
     # Auto-sincroniza catálogo WooCommerce na inicialização do container
     if settings.woocommerce_base_url and settings.woocommerce_consumer_key and settings.woocommerce_consumer_secret:
@@ -281,11 +279,11 @@ async def lifespan(_: FastAPI):
             from app.db import get_session as _get_session
             with next(_get_session()) as _session:
                 imported, images = await sync_products_from_woocommerce(_session)
-            _log.info("Auto-sync WooCommerce: %d produtos, %d imagens importados.", imported, images)
+            log.info("Auto-sync WooCommerce: %d produtos, %d imagens importados.", imported, images)
         except Exception as _exc:
-            _log.error("Falha no auto-sync WooCommerce na inicializacao: %s", _exc)
+            log.error("Falha no auto-sync WooCommerce na inicializacao: %s", _exc)
     else:
-        _log.warning("Credenciais WooCommerce nao configuradas; auto-sync ignorado.")
+        log.warning("Credenciais WooCommerce nao configuradas; auto-sync ignorado.")
     yield
 
 
@@ -438,15 +436,23 @@ async def receive_whatsapp_webhook(
 
             send_result = await send_whatsapp_message(to_phone=customer.whatsapp_phone, text=agent_response)
             if isinstance(send_result, dict) and send_result.get("error"):
-                import logging
-                logging.getLogger(__name__).error(
-                    "Falha ao enviar mensagem WhatsApp: status=%s body=%s",
-                    send_result.get("status_code"),
-                    send_result.get("response"),
+                log.error(
+                    "Falha ao enviar mensagem WhatsApp",
+                    extra={
+                        "event": "whatsapp_send_failed",
+                        "status_code": send_result.get("status_code"),
+                        "response": send_result.get("response"),
+                        "customer_phone": customer.whatsapp_phone,
+                    },
                 )
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).error("Erro ao processar mensagem do agente: %s", exc)
+            log.exception(
+                "Erro ao processar mensagem do agente",
+                extra={
+                    "event": "agent_message_processing_failed",
+                    "customer_phone": customer.whatsapp_phone,
+                },
+            )
 
     return {"received": True}
 
@@ -458,11 +464,8 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
 
     Deve ser chamado quando o agente registrar um pedido com pagamento via PIX manual.
     """
-    import logging
     from sqlmodel import select as sql_select
     from app.models import Order, OrderItem, OrderStatus, Customer
-
-    log = logging.getLogger(__name__)
     order = session.get(Order, order_id)
     if not order:
         raise HTTPException(status_code=404, detail=f"Pedido #{order_id} não encontrado.")

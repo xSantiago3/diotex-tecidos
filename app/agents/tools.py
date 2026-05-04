@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Any
@@ -23,6 +24,7 @@ from app.services.whatsapp import send_whatsapp_image, send_whatsapp_message
 from app.utils.phones import normalize_phone
 
 settings = get_settings()
+log = logging.getLogger(__name__)
 
 _BASE = "http://localhost:8080"
 
@@ -706,6 +708,17 @@ async def confirm_and_generate_pix(
         raise RuntimeError(f"{op_name} falhou apos {attempts} tentativas")
 
     async def _notify_admin_failure(stage: str, reason: str, order_id: int | None = None) -> None:
+        log.error(
+            "Falha no checkout automatizado",
+            extra={
+                "event": "checkout_automation_failed",
+                "stage": stage,
+                "reason": reason,
+                "order_id": order_id,
+                "customer_phone": whatsapp_phone,
+                "zipcode": zipcode,
+            },
+        )
         msg = (
             "⚠️ *Falha no checkout automatizado*\n"
             f"Etapa: {stage}\n"
@@ -853,6 +866,15 @@ async def confirm_and_generate_pix(
                 stage="geracao_pix",
                 reason=str(pix_exc),
                 order_id=order_id,
+            )
+            log.warning(
+                "PIX nao gerado apos tentativas, pedido ficou em contingencia",
+                extra={
+                    "event": "pix_generation_fallback",
+                    "order_id": order_id,
+                    "total_amount": total_amount,
+                    "shipping_amount": shipping_amount,
+                },
             )
             return {
                 "order_id": order_id,

@@ -1,6 +1,7 @@
 """Integração com Mercado Pago para geração de PIX e confirmação de pagamento."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -8,6 +9,7 @@ import httpx
 from app.config import get_settings
 
 _MP_BASE = "https://api.mercadopago.com"
+log = logging.getLogger(__name__)
 
 
 def _headers() -> dict[str, str]:
@@ -66,9 +68,43 @@ async def create_pix_payment(
     headers["X-Idempotency-Key"] = f"order-{order_id}-{uuid.uuid4().hex[:8]}"
 
     async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(f"{_MP_BASE}/v1/payments", json=body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = await client.post(f"{_MP_BASE}/v1/payments", json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            response_body = exc.response.text[:2000] if exc.response is not None else None
+            log.error(
+                "Mercado Pago retornou erro HTTP ao criar PIX",
+                extra={
+                    "event": "mercadopago_create_pix_http_error",
+                    "order_id": order_id,
+                    "status_code": exc.response.status_code if exc.response is not None else None,
+                    "response_body": response_body,
+                },
+            )
+            return {
+                "error": (
+                    f"Mercado Pago HTTP {exc.response.status_code if exc.response is not None else 'unknown'}"
+                )
+            }
+        except httpx.RequestError as exc:
+            log.error(
+                "Falha de rede ao criar PIX no Mercado Pago",
+                extra={
+                    "event": "mercadopago_create_pix_network_error",
+                    "order_id": order_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return {"error": f"Falha de rede Mercado Pago: {exc}"}
+        except Exception as exc:
+            log.exception(
+                "Erro inesperado ao criar PIX no Mercado Pago",
+                extra={"event": "mercadopago_create_pix_unexpected_error", "order_id": order_id},
+            )
+            return {"error": f"Erro inesperado Mercado Pago: {exc}"}
 
     txn = data.get("point_of_interaction", {}).get("transaction_data", {})
     return {
