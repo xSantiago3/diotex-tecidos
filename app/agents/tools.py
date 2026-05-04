@@ -36,6 +36,20 @@ def _normalize_search_text(value: str) -> str:
     return " ".join("".join(clean_chars).split())
 
 
+def _normalized_tokens(value: str) -> list[str]:
+    """Normaliza tokens e inclui uma forma singular simples para buscas tolerantes."""
+    base_tokens = _normalize_search_text(value).split()
+    normalized: list[str] = []
+    for token in base_tokens:
+        if token not in normalized:
+            normalized.append(token)
+        if token.endswith("s") and len(token) > 3:
+            singular = token[:-1]
+            if singular not in normalized:
+                normalized.append(singular)
+    return normalized
+
+
 def _build_product_url(slug: str | None) -> str | None:
     if not settings.woocommerce_base_url or not slug:
         return None
@@ -119,6 +133,7 @@ def search_products(query: str = "", limit: int = 10) -> dict[str, Any]:
             # Fallback tolerante a typos quando busca textual nao retornar resultados.
             if query and not rows:
                 normalized_query = _normalize_search_text(query)
+                query_tokens = _normalized_tokens(query)
                 pool_stmt = select(Product, Inventory).outerjoin(
                     Inventory, Inventory.product_id == Product.id
                 ).where(Product.active == True)  # noqa: E712
@@ -129,6 +144,7 @@ def search_products(query: str = "", limit: int = 10) -> dict[str, Any]:
                     normalized_name = _normalize_search_text(product.name or "")
                     if not normalized_name:
                         continue
+                    name_tokens = _normalized_tokens(product.name or "")
 
                     score = SequenceMatcher(None, normalized_query, normalized_name).ratio()
                     if normalized_query in normalized_name:
@@ -141,6 +157,34 @@ def search_products(query: str = "", limit: int = 10) -> dict[str, Any]:
                                 for part in name_parts
                             )
                             score = max(score, part_score)
+
+                    # Bônus por cobertura de tokens (ex.: "helancas rosa" -> "helanca rosa pink").
+                    token_hits = 0
+                    if query_tokens and name_tokens:
+                        for qtok in query_tokens:
+                            if any(
+                                (
+                                    qtok == ntok
+                                    or ntok.startswith(qtok)
+                                    or qtok.startswith(ntok)
+                                )
+                                and min(len(qtok), len(ntok)) >= 4
+                                for ntok in name_tokens
+                            ):
+                                token_hits += 1
+
+                    if query_tokens:
+                        required_hits = max(1, len(query_tokens) - 1)
+                        if token_hits >= required_hits:
+                            # Quanto mais tokens casar, maior a relevancia.
+                            token_boost = min(0.98, 0.85 + (0.04 * token_hits))
+                            score = max(score, token_boost)
+                        elif token_hits >= 1:
+                            score = max(score, 0.76)
+
+                    # Para consultas com 2+ termos, evita falsos positivos sem sobreposição de tokens.
+                    if len(query_tokens) >= 2 and token_hits == 0:
+                        continue
 
                     # limiar conservador: corrige typo comum sem abrir para ruido.
                     if score >= 0.72:
