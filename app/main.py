@@ -17,7 +17,9 @@ from app.config import get_settings
 from app.db import get_session, init_db
 from app.repositories import get_order_for_customer, upsert_customer
 from app.firestore_db import (
+    delete_order_firestore,
     get_order_firestore,
+    list_expired_open_orders_firestore,
     update_order_status_firestore,
     update_order_firestore,
     get_order_items_firestore,
@@ -73,6 +75,20 @@ def _admin_phones() -> list[str]:
     if settings.partner_phone and settings.partner_phone != settings.notification_phone:
         phones.append(settings.partner_phone)
     return phones
+
+
+def _validate_scheduler_token(token: str | None) -> None:
+    """Valida token de autenticação para endpoints internos de manutenção."""
+    if not settings.scheduler_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Scheduler token não configurado no servidor."
+        )
+    if not token or token != settings.scheduler_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Token de autenticação inválido ou ausente."
+        )
 
 
 async def _send_separation_template_to_admins(
@@ -268,8 +284,6 @@ async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Sess
                 f"Infelizmente não conseguimos confirmar o pagamento do pedido #{order_id}. "
                 "Se você já realizou o pagamento, entre em contato conosco para verificarmos. 🙏",
             )
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -288,6 +302,130 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+
+@app.post("/internal/orders/{order_id}/confirm-payment")
+async def confirm_order_payment_internal(
+    order_id: int,
+    request: Request,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Confirma manualmente um pagamento pendente e notifica o cliente.
+
+    Usado por fluxos internos, como confirmação via agent com OTP administrativo.
+    """
+    from sqlmodel import select as sql_select
+    from app.models import Order, OrderItem, OrderStatus, Customer
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    approved_by = str(body.get("approved_by") or "admin")
+
+    if settings.firestore_enabled:
+        try:
+            order = await get_order_firestore(order_id)
+            if not order:
+                raise HTTPException(status_code=404, detail=f"Pedido #{order_id} nao encontrado.")
+
+            reviewable = ("payment_under_review", "awaiting_payment")
+            if order.get("status") not in reviewable:
+                return {
+                    "confirmed": False,
+                    "order_id": order_id,
+                    "status": order.get("status"),
+                    "message": "Pedido ja processado.",
+                }
+
+            await update_order_firestore(
+                order_id,
+                {
+                    "status": "paid",
+                    "payment_reference": f"manual:{approved_by}",
+                    "updated_at": __import__("datetime").datetime.utcnow().isoformat(),
+                },
+            )
+
+            items = await get_order_items_firestore(order_id)
+            customer_phone = order.get("customer_whatsapp")
+            if customer_phone:
+                shipping_quote = order.get("shipping_quote_json") or {}
+                delivery_days = shipping_quote.get("delivery_days_with_preparation")
+                delivery_str = f"{delivery_days} dias uteis" if delivery_days else "a combinar"
+                products_list = ", ".join(
+                    f"{i.get('product_name_snapshot', '')} ({i.get('quantity', 1)}m)"
+                    for i in items
+                )
+                await send_whatsapp_template(
+                    to_phone=customer_phone,
+                    template_name=settings.order_confirmed_template_name,
+                    body_variables=[
+                        order.get("customer_name", "Cliente").split()[0],
+                        str(order_id),
+                        products_list,
+                        f"{order.get('total_amount', 0):.2f}",
+                        delivery_str,
+                    ],
+                )
+
+            log.info("Pagamento confirmado manualmente via endpoint interno", extra={
+                "event": "manual_payment_confirmed",
+                "order_id": order_id,
+                "approved_by": approved_by,
+                "backend": "firestore",
+            })
+            return {"confirmed": True, "order_id": order_id, "status": "paid"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.error("Erro ao confirmar pagamento manual via Firestore: %s", exc)
+
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail=f"Pedido #{order_id} nao encontrado.")
+
+    reviewable = (OrderStatus.payment_under_review, OrderStatus.awaiting_payment)
+    if order.status not in reviewable:
+        return {
+            "confirmed": False,
+            "order_id": order_id,
+            "status": order.status.value,
+            "message": "Pedido ja processado.",
+        }
+
+    order.status = OrderStatus.paid
+    order.payment_reference = f"manual:{approved_by}"
+    session.add(order)
+    session.commit()
+
+    customer = session.get(Customer, order.customer_id)
+    items = session.exec(sql_select(OrderItem).where(OrderItem.order_id == order.id)).all()
+    if customer and customer.whatsapp_phone:
+        shipping_quote = getattr(order, "shipping_quote_json", None) or {}
+        delivery_days = shipping_quote.get("delivery_days_with_preparation")
+        delivery_str = f"{delivery_days} dias uteis" if delivery_days else "a combinar"
+        products_list = ", ".join(f"{i.product_name_snapshot} ({i.quantity}m)" for i in items)
+        await send_whatsapp_template(
+            to_phone=customer.whatsapp_phone,
+            template_name=settings.order_confirmed_template_name,
+            body_variables=[
+                (customer.name or "Cliente").split()[0],
+                str(order.id),
+                products_list,
+                f"{order.total_amount:.2f}",
+                delivery_str,
+            ],
+        )
+
+    log.info("Pagamento confirmado manualmente via endpoint interno", extra={
+        "event": "manual_payment_confirmed",
+        "order_id": order_id,
+        "approved_by": approved_by,
+        "backend": "sql",
+    })
+    return {"confirmed": True, "order_id": order_id, "status": order.status.value}
 
 
 def _prune_processed_message_ids(now: float) -> None:
@@ -434,17 +572,18 @@ async def receive_whatsapp_webhook(
                 message=orchestrator_message,
             )
 
-            send_result = await send_whatsapp_message(to_phone=customer.whatsapp_phone, text=agent_response)
-            if isinstance(send_result, dict) and send_result.get("error"):
-                log.error(
-                    "Falha ao enviar mensagem WhatsApp",
-                    extra={
-                        "event": "whatsapp_send_failed",
-                        "status_code": send_result.get("status_code"),
-                        "response": send_result.get("response"),
-                        "customer_phone": customer.whatsapp_phone,
-                    },
-                )
+            if agent_response and agent_response.strip():
+                send_result = await send_whatsapp_message(to_phone=customer.whatsapp_phone, text=agent_response)
+                if isinstance(send_result, dict) and send_result.get("error"):
+                    log.error(
+                        "Falha ao enviar mensagem WhatsApp",
+                        extra={
+                            "event": "whatsapp_send_failed",
+                            "status_code": send_result.get("status_code"),
+                            "response": send_result.get("response"),
+                            "customer_phone": customer.whatsapp_phone,
+                        },
+                    )
         except Exception as exc:
             log.exception(
                 "Erro ao processar mensagem do agente",
@@ -501,6 +640,69 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
     await _send_pix_review_to_admins(order, customer, items)
     log.info("Notificacoes de PIX pendente enviadas para pedido #%s", order_id)
     return {"notified": True, "order_id": order_id}
+
+
+@app.post("/internal/maintenance/cleanup-expired-orders")
+def cleanup_expired_orders(
+    request: Request,
+    dry_run: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Remove pedidos em aberto expirados (mais de 48h) no Firestore.
+
+    Statuses considerados "em aberto": awaiting_shipping_choice,
+    awaiting_payment_method e awaiting_payment.
+    
+    Requer autenticação via header X-Scheduler-Token.
+    """
+    # Validar token de autenticação
+    token = request.headers.get("X-Scheduler-Token")
+    _validate_scheduler_token(token)
+    
+    if not settings.firestore_enabled:
+        raise HTTPException(status_code=400, detail="Firestore desabilitado.")
+
+    expired_orders = list_expired_open_orders_firestore(limit=limit)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "found": len(expired_orders),
+            "deleted": 0,
+            "orders": [
+                {
+                    "order_id": o.get("id"),
+                    "order_number": o.get("order_number"),
+                    "status": o.get("status"),
+                    "expires_at": o.get("expires_at"),
+                    "last_modified_at": o.get("last_modified_at"),
+                }
+                for o in expired_orders
+            ],
+        }
+
+    deleted = 0
+    for order in expired_orders:
+        order_id = order.get("id")
+        if not order_id:
+            continue
+        if delete_order_firestore(int(order_id)):
+            deleted += 1
+
+    log.info(
+        "Cleanup de pedidos expirados executado",
+        extra={
+            "event": "cleanup_expired_orders",
+            "found": len(expired_orders),
+            "deleted": deleted,
+            "limit": limit,
+        },
+    )
+
+    return {
+        "dry_run": False,
+        "found": len(expired_orders),
+        "deleted": deleted,
+    }
 
 
 @app.post("/webhooks/mercadopago")
