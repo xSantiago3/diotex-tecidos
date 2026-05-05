@@ -266,9 +266,6 @@ async def send_whatsapp_order_details_template(
                         "payment_settings": [
                             {
                                 "type": "pix",
-                                "pix": {
-                                    "code": pix_key,
-                                },
                             }
                         ],
                         "order": {
