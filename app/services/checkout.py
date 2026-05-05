@@ -144,6 +144,7 @@ async def create_checkout_quote(session: Session, payload: CheckoutQuoteRequest)
                 customer_whatsapp=customer.whatsapp_phone,
                 customer_name=customer.name or "",
                 customer_email=customer.email or "",
+                customer_cpf=customer.cpf or "",
                 channel=payload.channel,
                 shipping_zipcode=effective_zipcode,
                 shipping_quote_json=selected_option.model_dump(),

@@ -5,11 +5,17 @@ import time
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService, VertexAiSessionService
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.logging_config import configure_logging
 from app.agents.root import root_agent
 from app.config import get_settings
+
+try:
+    from google.adk.errors.session_not_found_error import SessionNotFoundError as _AiSessionNotFoundError
+except ImportError:
+    _AiSessionNotFoundError = None  # type: ignore[assignment,misc]
 
 
 configure_logging()
@@ -44,32 +50,69 @@ def _resolve_session_id(user_id: str, session_id: str) -> str:
     return active_session_ids.get((user_id, session_id), session_id)
 
 
-async def run_agent_message(user_id: str, session_id: str, message: str) -> str:
-    base_session_key = (user_id, session_id)
-    effective_session_id = _resolve_session_id(user_id, session_id)
-    session_key = (user_id, effective_session_id)
+async def _ensure_session(user_id: str, session_id: str, base_session_key: tuple[str, str]) -> str:
+    """Garante que a sessão existe e retorna o session_id efetivo real.
+
+    O VertexAiSessionService pode ignorar o session_id solicitado e atribuir um ID
+    gerado pelo servidor. Esta função captura o ID real e atualiza active_session_ids.
+    """
     if isinstance(session_service, InMemorySessionService):
+        session_key = (user_id, session_id)
         if session_key not in known_sessions:
             await session_service.create_session(
-                app_name=_app_name, user_id=user_id, session_id=effective_session_id
+                app_name=_app_name, user_id=user_id, session_id=session_id
             )
             known_sessions.add(session_key)
-    else:
-        existing = await session_service.get_session(
-            app_name=_app_name, user_id=user_id, session_id=effective_session_id
-        )
-        if existing is None:
-            await session_service.create_session(
-                app_name=_app_name, user_id=user_id, session_id=effective_session_id
-            )
+        return session_id
 
+    # VertexAiSessionService: verifica se já existe; se não, cria e captura ID real.
+    existing = await session_service.get_session(
+        app_name=_app_name, user_id=user_id, session_id=session_id
+    )
+    if existing is not None:
+        real_id = getattr(existing, "id", None) or getattr(existing, "session_id", None) or session_id
+        if real_id != session_id:
+            active_session_ids[base_session_key] = real_id
+        return real_id
+
+    try:
+        created = await session_service.create_session(
+            app_name=_app_name, user_id=user_id, session_id=session_id
+        )
+        real_id = (
+            getattr(created, "id", None)
+            or getattr(created, "session_id", None)
+            or session_id
+        ) if created is not None else session_id
+        if real_id != session_id:
+            log.info(
+                "VertexAI atribuiu session_id=%s (solicitado=%s) para user=%s",
+                real_id, session_id, user_id,
+            )
+            active_session_ids[base_session_key] = real_id
+        return real_id
+    except genai_errors.ClientError as e:
+        if "already exists" not in str(e):
+            raise
+        # Criado concorrentemente — relê para obter ID real
+        existing2 = await session_service.get_session(
+            app_name=_app_name, user_id=user_id, session_id=session_id
+        )
+        if existing2 is not None:
+            real_id = getattr(existing2, "id", None) or getattr(existing2, "session_id", None) or session_id
+            active_session_ids[base_session_key] = real_id
+            return real_id
+        return session_id
+
+
+async def _collect_runner_response(user_id: str, session_id: str, message: str) -> str:
+    """Executa runner.run_async e coleta texto final."""
     last_agent_text: str = ""
     async for event in runner.run_async(
         user_id=user_id,
-        session_id=effective_session_id,
+        session_id=session_id,
         new_message=types.Content(role="user", parts=[types.Part(text=message)]),
     ):
-        # Só nos interessa a resposta final do agente (não function_call/function_response)
         if not getattr(event, "is_final_response", False):
             continue
         content = getattr(event, "content", None)
@@ -80,10 +123,45 @@ async def run_agent_message(user_id: str, session_id: str, message: str) -> str:
         text = "\n".join(t for t in text_parts if t).strip()
         if text:
             last_agent_text = text
+    return last_agent_text
 
-    # Garante consistência caso a sessão efetiva tenha sido criada a partir do ID base.
+
+async def run_agent_message(user_id: str, session_id: str, message: str) -> str:
+    base_session_key = (user_id, session_id)
+    effective_session_id = _resolve_session_id(user_id, session_id)
+
+    effective_session_id = await _ensure_session(user_id, effective_session_id, base_session_key)
+
+    try:
+        last_agent_text = await _collect_runner_response(user_id, effective_session_id, message)
+    except Exception as exc:
+        # SessionNotFoundError: sessão não encontrada pelo runner (pode ter sido deletada
+        # externamente ou o VertexAI atribuiu ID diferente). Cria sessão nova e tenta uma vez.
+        is_session_error = (
+            (_AiSessionNotFoundError is not None and isinstance(exc, _AiSessionNotFoundError))
+            or "session not found" in str(exc).lower()
+        )
+        if not is_session_error:
+            raise
+        log.warning(
+            "SessionNotFoundError para user=%s session=%s — criando nova sessão e retentando",
+            user_id, effective_session_id,
+        )
+        new_session_id = f"{session_id}-{int(time.time())}"
+        created = await session_service.create_session(
+            app_name=_app_name, user_id=user_id, session_id=new_session_id
+        )
+        effective_session_id = (
+            getattr(created, "id", None)
+            or getattr(created, "session_id", None)
+            or new_session_id
+        ) if created is not None else new_session_id
+        active_session_ids[base_session_key] = effective_session_id
+        if isinstance(session_service, InMemorySessionService):
+            known_sessions.add((user_id, effective_session_id))
+        last_agent_text = await _collect_runner_response(user_id, effective_session_id, message)
+
     active_session_ids[base_session_key] = effective_session_id
-
     return last_agent_text
 
 

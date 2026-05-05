@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     pix_review_template_name: str = Field(default="avaliar_pagamento_pix", alias="PIX_REVIEW_TEMPLATE_NAME")
     # Telefone para notificações de pagamento aprovado (padrão: mesmo do admin)
     notification_phone: str = Field(default="+5511982732814", alias="NOTIFICATION_PHONE")
+    # Telefone de um sócio para também receber notificações (opcional)
+    partner_phone: str | None = Field(default=None, alias="PARTNER_PHONE")
     # Internal maintenance endpoints token
     scheduler_token: str | None = Field(default=None, alias="SCHEDULER_TOKEN")
 

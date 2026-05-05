@@ -101,18 +101,36 @@ async def generate_label_for_order(
         # Fallback conservador
         volume = {"height": 10, "width": 20, "length": 30, "weight": 1.0}
 
+    def _item_val(i: Any, attr: str, default: Any = "") -> Any:
+        if isinstance(i, dict):
+            return i.get(attr, default)
+        return getattr(i, attr, default)
+
     products_payload = [
         {
-            "name": i.product_name_snapshot[:50],
-            "quantity": str(int(i.quantity)),
-            "unitary_value": str(round(i.unit_price_snapshot, 2)),
+            "name": str(_item_val(i, "product_name_snapshot") or "Produto")[:50],
+            "quantity": str(int(_item_val(i, "quantity", 1))),
+            "unitary_value": str(round(float(_item_val(i, "unit_price_snapshot", 0)), 2)),
         }
         for i in items
     ]
 
+    # Mapeamento de campos: label.py usa nomes padrão, mas dicts do Firestore
+    # (order dicts) usam nomes diferentes como customer_whatsapp, customer_name.
+    _FIELD_ALIASES: dict[str, list[str]] = {
+        "whatsapp_phone": ["whatsapp_phone", "customer_whatsapp", "customer_phone"],
+        "name": ["name", "customer_name"],
+        "email": ["email", "customer_email"],
+        "cpf": ["cpf", "customer_cpf"],
+    }
+
     def _read_customer(key: str, default: str = "") -> str:
         if isinstance(customer, dict):
-            return str(customer.get(key, default) or default)
+            for field in _FIELD_ALIASES.get(key, [key]):
+                val = customer.get(field)
+                if val:
+                    return str(val)
+            return str(default)
         return str(getattr(customer, key, default) or default)
 
     phone_digits = "".join(c for c in _read_customer("whatsapp_phone") if c.isdigit())
@@ -208,6 +226,26 @@ async def generate_label_for_order(
             shipment_data = generated.get(shipment_id) or next(iter(generated.values()), {})
             if isinstance(shipment_data, dict):
                 tracking_code = shipment_data.get("tracking")
+
+        # Fallback: busca tracking via endpoint dedicado se não veio no generate
+        if not tracking_code:
+            try:
+                r_track = await client.get(
+                    _me_url("/me/shipment/tracking"),
+                    headers=_me_headers(),
+                    params={"orders[]": shipment_id},
+                )
+                if not r_track.is_error:
+                    track_data = r_track.json()
+                    log.info("ME tracking response — pedido #%s resp=%s", order.id, track_data)
+                    if isinstance(track_data, dict):
+                        entry = track_data.get(shipment_id) or next(iter(track_data.values()), {})
+                        if isinstance(entry, dict):
+                            tracking_code = entry.get("tracking") or entry.get("code") or entry.get("tracking_code")
+                        elif isinstance(entry, str):
+                            tracking_code = entry
+            except Exception as track_exc:
+                log.warning("Falha ao buscar tracking ME para pedido #%s: %s", order.id, track_exc)
 
         # 4. Imprimir (gerar link público PDF)
         r = await client.post(

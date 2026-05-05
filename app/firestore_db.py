@@ -48,6 +48,34 @@ def _build_order_number(order_id: int) -> str:
     return f"DTX-{dt:%Y%m%d}-{order_id:06d}"
 
 
+def _next_order_id_firestore(db: Any) -> int:
+    """Gera ID sequencial para pedidos no Firestore."""
+    from firebase_admin import firestore
+
+    counter_ref = db.collection("metadata").document("order_counter")
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def _reserve_id(txn: Any) -> int:
+        snapshot = counter_ref.get(transaction=txn)
+        last_id = 0
+        if snapshot.exists:
+            raw = snapshot.to_dict().get("last_id")
+            try:
+                last_id = int(raw or 0)
+            except Exception:
+                last_id = 0
+        next_id = last_id + 1
+        txn.set(
+            counter_ref,
+            {"last_id": next_id, "updated_at": _now_iso()},
+            merge=True,
+        )
+        return next_id
+
+    return int(_reserve_id(transaction))
+
+
 def _compute_expires_at_for_status(status: str, base_time: datetime | None = None) -> str | None:
     if status not in OPEN_ORDER_STATUSES:
         return None
@@ -157,6 +185,7 @@ async def create_order_firestore(
     shipping_quote_json: dict | None = None,
     customer_name: str = "",
     customer_email: str = "",
+    customer_cpf: str = "",
     channel: str = "whatsapp",
     subtotal_amount: float | None = None,
     status: str = "awaiting_payment",
@@ -174,13 +203,16 @@ async def create_order_firestore(
     effective_carrier = carrier_name or (shipping_quote_json or {}).get("carrier_name")
     expires_at = _compute_expires_at_for_status(status, datetime.utcnow())
 
+    order_id = _next_order_id_firestore(db)
     order_data = {
-        "order_number": "",
+        "id": order_id,
+        "order_number": _build_order_number(order_id),
         "customer_id": customer_whatsapp,
         "customer_phone": customer_whatsapp,
         "customer_whatsapp": customer_whatsapp,
         "customer_name": customer_name,
         "customer_email": customer_email,
+        "customer_cpf": customer_cpf,
         "channel": channel,
         "shipping_zipcode": shipping_zipcode,
         "address_number": address_number,
@@ -202,9 +234,7 @@ async def create_order_firestore(
         "expires_at": expires_at,
     }
 
-    _, doc_ref = db.collection("orders").add(order_data)
-    order_id = int(doc_ref.id) if doc_ref.id.isdigit() else hash(doc_ref.id) % 1000000
-    doc_ref.update({"id": order_id, "order_number": _build_order_number(order_id)})
+    db.collection("orders").document(str(order_id)).set(order_data)
 
     return order_id
 
@@ -218,6 +248,28 @@ async def get_order_firestore(order_id: int) -> dict[str, Any] | None:
         data["_doc_id"] = doc.id
         return data
     return None
+
+
+async def get_latest_pending_pix_order_firestore(customer_whatsapp: str) -> dict[str, Any] | None:
+    """Retorna o pedido PIX manual mais recente ainda aguardando comprovacao do cliente/admin."""
+    db = get_firestore()
+    docs = (
+        db.collection("orders")
+        .where("customer_whatsapp", "==", customer_whatsapp)
+        .where("payment_provider", "==", "pix_manual")
+        .where("status", "==", "payment_under_review")
+        .stream()
+    )
+    latest_order: dict[str, Any] | None = None
+    latest_timestamp: datetime | None = None
+    for doc in docs:
+        data = doc.to_dict() or {}
+        updated_at = _to_datetime(data.get("updated_at")) or _to_datetime(data.get("created_at"))
+        if latest_order is None or (updated_at and (latest_timestamp is None or updated_at > latest_timestamp)):
+            data["_doc_id"] = doc.id
+            latest_order = data
+            latest_timestamp = updated_at
+    return latest_order
 
 
 async def update_order_firestore(order_id: int, updates: dict[str, Any]) -> bool:
@@ -395,6 +447,64 @@ def list_expired_open_orders_firestore(limit: int = 200) -> list[dict[str, Any]]
             data["_doc_id"] = doc.id
             expired.append(data)
     return expired
+
+
+async def delete_customer_data_firestore(whatsapp_phone: str) -> dict[str, int]:
+    """Apaga TODOS os dados de um cliente do Firestore: pedidos, itens, carrinhos, itens de carrinho e cadastro.
+
+    Retorna contagens do que foi removido.
+    """
+    db = get_firestore()
+
+    # 1. Pedidos do cliente + seus itens
+    order_ids: list[int] = []
+    order_doc_ids: list[str] = []
+    for field in ("customer_whatsapp", "customer_phone"):
+        docs = db.collection("orders").where(field, "==", whatsapp_phone).stream()
+        for doc in docs:
+            data = doc.to_dict() or {}
+            oid = data.get("id")
+            if oid is not None and oid not in order_ids:
+                order_ids.append(int(oid))
+                order_doc_ids.append(doc.id)
+
+    deleted_order_items = 0
+    for oid in order_ids:
+        item_docs = db.collection("order_items").where("order_id", "==", oid).stream()
+        for item_doc in item_docs:
+            db.collection("order_items").document(item_doc.id).delete()
+            deleted_order_items += 1
+
+    for doc_id in order_doc_ids:
+        db.collection("orders").document(doc_id).delete()
+
+    # 2. Carrinhos + itens de carrinho
+    cart_ids: list[str] = []
+    cart_docs = db.collection("carts").where("customer_whatsapp", "==", whatsapp_phone).stream()
+    for doc in cart_docs:
+        cart_ids.append(doc.id)
+        db.collection("carts").document(doc.id).delete()
+
+    deleted_cart_items = 0
+    for cart_id in cart_ids:
+        item_docs = db.collection("cart_items").where("cart_id", "==", cart_id).stream()
+        for item_doc in item_docs:
+            db.collection("cart_items").document(item_doc.id).delete()
+            deleted_cart_items += 1
+
+    # 3. Documento do cliente
+    customer_ref = db.collection("customers").document(whatsapp_phone)
+    customer_existed = customer_ref.get().exists
+    if customer_existed:
+        customer_ref.delete()
+
+    return {
+        "orders_deleted": len(order_doc_ids),
+        "order_items_deleted": deleted_order_items,
+        "carts_deleted": len(cart_ids),
+        "cart_items_deleted": deleted_cart_items,
+        "customer_deleted": 1 if customer_existed else 0,
+    }
 
 
 def delete_order_firestore(order_id: int) -> bool:

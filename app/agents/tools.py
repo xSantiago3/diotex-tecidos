@@ -12,11 +12,12 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import get_db_session
+from app.firestore_db import add_order_item_firestore, create_order_firestore, get_customer_firestore, upsert_customer_firestore
 from app.models import Cart, CartItem, Customer, Inventory, Order, OrderItem, OrderStatus, Product, ProductImage
 from app.repositories import get_order_for_customer, upsert_customer
 from app.schemas import CheckoutItemRequest, CheckoutQuoteRequest, CustomerUpsert, ShippingProvider, ShippingQuoteRequest
 from app.services.checkout import create_checkout_quote
-from app.services.security import assert_admin_phone, start_admin_otp, verify_admin_otp
+from app.services.security import assert_admin_phone
 from app.services.shipping import calculate_shipping_quote
 from app.services.whatsapp import send_whatsapp_image, send_whatsapp_message
 from app.utils.phones import normalize_phone
@@ -487,15 +488,13 @@ def request_admin_otp(whatsapp_phone: str, purpose: str = "admin") -> dict[str, 
 
 def update_product_price(
     whatsapp_phone: str,
-    otp_code: str,
     product_id: int,
     new_price: float,
 ) -> dict[str, Any]:
-    """Atualiza o preço de um produto após validação do OTP admin.
+    """Atualiza o preço de um produto. Requer que whatsapp_phone seja admin.
 
     Args:
         whatsapp_phone: Número do WhatsApp do admin solicitante.
-        otp_code: Código OTP recebido via request_admin_otp.
         product_id: ID do produto a atualizar.
         new_price: Novo preço em reais.
 
@@ -504,7 +503,7 @@ def update_product_price(
     """
     try:
         with get_db_session() as session:
-            verify_admin_otp(session, whatsapp_phone, "update_price", otp_code)
+            assert_admin_phone(whatsapp_phone)
             product = session.get(Product, product_id)
             if not product:
                 return {"error": f"Produto {product_id} nao encontrado."}
@@ -519,15 +518,13 @@ def update_product_price(
 
 def update_product_stock(
     whatsapp_phone: str,
-    otp_code: str,
     product_id: int,
     new_quantity: float,
 ) -> dict[str, Any]:
-    """Atualiza o estoque disponível de um produto após validação do OTP admin.
+    """Atualiza o estoque disponível de um produto. Requer que whatsapp_phone seja admin.
 
     Args:
         whatsapp_phone: Número do WhatsApp do admin solicitante.
-        otp_code: Código OTP recebido via request_admin_otp.
         product_id: ID do produto a atualizar.
         new_quantity: Nova quantidade disponível em estoque.
 
@@ -536,7 +533,7 @@ def update_product_stock(
     """
     try:
         with get_db_session() as session:
-            verify_admin_otp(session, whatsapp_phone, "update_stock", otp_code)
+            assert_admin_phone(whatsapp_phone)
             product = session.get(Product, product_id)
             if not product:
                 return {"error": f"Produto {product_id} nao encontrado."}
@@ -554,18 +551,15 @@ def update_product_stock(
 
 def confirm_order_payment(
     whatsapp_phone: str,
-    otp_code: str,
     order_id: int,
 ) -> dict[str, Any]:
-    """Confirma manualmente um pagamento pendente usando OTP administrativo.
+    """Confirma manualmente um pagamento pendente.
 
     Use quando um admin confirmar que o PIX caiu ou quiser marcar um pedido
     pendente como pago manualmente.
     """
     try:
-        with get_db_session() as session:
-            verify_admin_otp(session, whatsapp_phone, "confirm_payment", otp_code)
-
+        assert_admin_phone(whatsapp_phone)
         result = _sync_post(
             f"/internal/orders/{order_id}/confirm-payment",
             {"approved_by": normalize_phone(whatsapp_phone)},
@@ -736,20 +730,35 @@ def remove_from_cart(whatsapp_phone: str, product_id: int, tool_context: ToolCon
         return {"error": str(exc)}
 
 
-def get_checkout_customer_profile(whatsapp_phone: str, tool_context: ToolContext) -> dict[str, Any]:
+async def get_checkout_customer_profile(whatsapp_phone: str, tool_context: ToolContext) -> dict[str, Any]:
     """Retorna dados salvos do comprador para confirmar antes de gerar pedido.
 
-    Use esta tool no início do checkout para perguntar:
-    "Esses continuam sendo seus dados?"
+    Use esta tool no início do checkout para verificar dados existentes.
+    A resposta inclui has_saved_data e missing_fields para orientar o próximo passo:
+    - Se has_saved_data=false: colete todos os dados (CEP, nome, email, CPF, numero)
+    - Se missing_fields é vazio: pergunte "Esses continuam sendo seus dados?"
+    - Se missing_fields não é vazio: mostre dados existentes e colete os faltantes
     """
     try:
         normalized_phone = normalize_phone(whatsapp_phone)
-        with get_db_session() as session:
-            customer = session.exec(
-                select(Customer).where(Customer.whatsapp_phone == normalized_phone)
-            ).first()
+        customer_data: dict[str, Any] | None = None
+        if settings.firestore_enabled:
+            customer_data = await get_customer_firestore(normalized_phone)
+        else:
+            with get_db_session() as session:
+                c = session.exec(
+                    select(Customer).where(Customer.whatsapp_phone == normalized_phone)
+                ).first()
+                if c:
+                    customer_data = {
+                        "zipcode": c.zipcode,
+                        "name": c.name,
+                        "email": c.email,
+                        "cpf": c.cpf,
+                        "address_number": c.address_number,
+                    }
 
-        if not customer:
+        if not customer_data:
             return {
                 "has_saved_data": False,
                 "customer_profile": {
@@ -767,11 +776,11 @@ def get_checkout_customer_profile(whatsapp_phone: str, tool_context: ToolContext
             }
 
         profile = {
-            "zipcode": customer.zipcode or "",
-            "full_name": customer.name or "",
-            "email": customer.email or "",
-            "cpf": customer.cpf or "",
-            "address_number": customer.address_number or "",
+            "zipcode": customer_data.get("zipcode") or "",
+            "full_name": customer_data.get("name") or "",
+            "email": customer_data.get("email") or "",
+            "cpf": customer_data.get("cpf") or "",
+            "address_number": customer_data.get("address_number") or "",
         }
         missing_fields = [field for field, value in profile.items() if not value]
 
@@ -781,24 +790,41 @@ def get_checkout_customer_profile(whatsapp_phone: str, tool_context: ToolContext
         tool_context.state["customer_cpf"] = profile["cpf"]
         tool_context.state["customer_address_number"] = profile["address_number"]
 
-        return {
-            "has_saved_data": True,
-            "customer_profile": profile,
-            "missing_fields": missing_fields,
-            "confirmation_prompt": (
-                "Esses continuam sendo seus dados?\\n"
-                f"CEP: {profile['zipcode'] or '-'}\\n"
-                f"Nome Completo: {profile['full_name'] or '-'}\\n"
-                f"email: {profile['email'] or '-'}\\n"
-                f"CPF: {profile['cpf'] or '-'}\\n"
-                f"Numero: {profile['address_number'] or '-'}"
-            ),
-        }
+        if missing_fields:
+            return {
+                "has_saved_data": True,
+                "customer_profile": profile,
+                "missing_fields": missing_fields,
+                "confirmation_prompt": (
+                    f"Tenho alguns dados seus salvos, mas faltam: {', '.join(missing_fields)}\\n"
+                    f"Dados que ja tenho:\\n"
+                    f"CEP: {profile['zipcode'] or '-'}\\n"
+                    f"Nome Completo: {profile['full_name'] or '-'}\\n"
+                    f"E-mail: {profile['email'] or '-'}\\n"
+                    f"CPF: {profile['cpf'] or '-'}\\n"
+                    f"Numero: {profile['address_number'] or '-'}\\n\\n"
+                    f"Me informe os dados faltantes: {', '.join(missing_fields)}"
+                ),
+            }
+        else:
+            return {
+                "has_saved_data": True,
+                "customer_profile": profile,
+                "missing_fields": [],
+                "confirmation_prompt": (
+                    "Esses continuam sendo seus dados?\\n"
+                    f"CEP: {profile['zipcode']}\\n"
+                    f"Nome Completo: {profile['full_name']}\\n"
+                    f"E-mail: {profile['email']}\\n"
+                    f"CPF: {profile['cpf']}\\n"
+                    f"Numero: {profile['address_number']}"
+                ),
+            }
     except Exception as exc:
         return {"error": str(exc)}
 
 
-def _build_open_cart_checkout_snapshot(
+async def _build_open_cart_checkout_snapshot(
     whatsapp_phone: str,
     zipcode: str,
     customer_name: str,
@@ -806,6 +832,15 @@ def _build_open_cart_checkout_snapshot(
     customer_cpf: str,
     address_number: str,
 ) -> dict[str, Any]:
+    if settings.firestore_enabled:
+        await upsert_customer_firestore(
+            whatsapp_phone=whatsapp_phone,
+            name=customer_name or None,
+            email=customer_email or None,
+            cpf=customer_cpf or None,
+            zipcode=zipcode or None,
+            address_number=address_number or None,
+        )
     with get_db_session() as session:
         customer = upsert_customer(session, CustomerUpsert(
             whatsapp_phone=whatsapp_phone,
@@ -904,7 +939,7 @@ async def prepare_checkout_options(
     if not zipcode:
         return {"error": "CEP de entrega nao informado."}
 
-    snapshot = _build_open_cart_checkout_snapshot(
+    snapshot = await _build_open_cart_checkout_snapshot(
         whatsapp_phone=whatsapp_phone,
         zipcode=zipcode,
         customer_name=customer_name,
@@ -1015,7 +1050,7 @@ async def finalize_checkout_payment(
     total_amount = round(subtotal + shipping_amount, 2)
 
     # Revalida carrinho aberto e dados atuais antes de fechar
-    fresh_snapshot = _build_open_cart_checkout_snapshot(
+    fresh_snapshot = await _build_open_cart_checkout_snapshot(
         whatsapp_phone=whatsapp_phone,
         zipcode=zipcode,
         customer_name=customer_name,
@@ -1026,39 +1061,76 @@ async def finalize_checkout_payment(
     if fresh_snapshot.get("error"):
         return fresh_snapshot
 
-    with get_db_session() as session:
-        order_status = OrderStatus.payment_under_review if payment_method == "pix" else OrderStatus.awaiting_payment
-        order = Order(
-            customer_id=fresh_snapshot["customer_id"],
-            channel="whatsapp",
-            shipping_zipcode=zipcode,
-            subtotal_amount=subtotal,
-            shipping_amount=shipping_amount,
-            total_amount=total_amount,
-            status=order_status,
-            payment_provider="pix_manual" if payment_method == "pix" else "mercadopago",
-            shipping_quote_json=selected_shipping,
-        )
-        session.add(order)
-        session.commit()
-        session.refresh(order)
-        order_id = order.id
+    order_status = OrderStatus.payment_under_review if payment_method == "pix" else OrderStatus.awaiting_payment
+    if settings.firestore_enabled:
+        try:
+            order_id = await create_order_firestore(
+                customer_whatsapp=whatsapp_phone,
+                shipping_zipcode=zipcode,
+                subtotal_amount=subtotal,
+                shipping_amount=shipping_amount,
+                total_amount=total_amount,
+                shipping_quote_json=selected_shipping,
+                customer_name=customer_name,
+                customer_email=customer_email,
+                customer_cpf=customer_cpf,
+                channel="whatsapp",
+                status=order_status.value,
+                payment_provider="pix_manual" if payment_method == "pix" else "mercadopago",
+                carrier_name=str(selected_shipping.get("carrier_name") or ""),
+                address_number=address_number,
+            )
+            for ci in fresh_snapshot["cart_items_data"]:
+                await add_order_item_firestore(
+                    order_id=order_id,
+                    product_id=ci["product_id"],
+                    quantity=ci["quantity"],
+                    product_name_snapshot=ci["product_name_snapshot"],
+                    unit_price_snapshot=ci["unit_price_snapshot"],
+                    line_total=ci["line_total"],
+                )
+        except Exception as exc:
+            return {"error": f"Falha ao salvar pedido no Firestore: {exc}"}
 
-        for ci in fresh_snapshot["cart_items_data"]:
-            session.add(OrderItem(
-                order_id=order_id,
-                product_id=ci["product_id"],
-                product_name_snapshot=ci["product_name_snapshot"],
-                unit_price_snapshot=ci["unit_price_snapshot"],
-                quantity=ci["quantity"],
-                line_total=ci["line_total"],
-            ))
+        with get_db_session() as session:
+            cart_db = session.get(Cart, fresh_snapshot["cart_id"])
+            if cart_db:
+                cart_db.status = "closed"
+                session.add(cart_db)
+                session.commit()
+    else:
+        with get_db_session() as session:
+            order = Order(
+                customer_id=fresh_snapshot["customer_id"],
+                channel="whatsapp",
+                shipping_zipcode=zipcode,
+                subtotal_amount=subtotal,
+                shipping_amount=shipping_amount,
+                total_amount=total_amount,
+                status=order_status,
+                payment_provider="pix_manual" if payment_method == "pix" else "mercadopago",
+                shipping_quote_json=selected_shipping,
+            )
+            session.add(order)
+            session.commit()
+            session.refresh(order)
+            order_id = order.id
 
-        cart_db = session.get(Cart, fresh_snapshot["cart_id"])
-        if cart_db:
-            cart_db.status = "closed"
-            session.add(cart_db)
-        session.commit()
+            for ci in fresh_snapshot["cart_items_data"]:
+                session.add(OrderItem(
+                    order_id=order_id,
+                    product_id=ci["product_id"],
+                    product_name_snapshot=ci["product_name_snapshot"],
+                    unit_price_snapshot=ci["unit_price_snapshot"],
+                    quantity=ci["quantity"],
+                    line_total=ci["line_total"],
+                ))
+
+            cart_db = session.get(Cart, fresh_snapshot["cart_id"])
+            if cart_db:
+                cart_db.status = "closed"
+                session.add(cart_db)
+            session.commit()
 
     tool_context.state["last_order_id"] = order_id
     tool_context.state["customer_cpf"] = customer_cpf

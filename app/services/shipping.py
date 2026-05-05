@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from app.config import get_settings
 from app.schemas import ShippingProvider, ShippingQuoteOption, ShippingQuoteRequest, ShippingQuoteResponse
+
+log = logging.getLogger(__name__)
 
 
 def _sanitize_zipcode(zipcode: str) -> str:
@@ -50,6 +53,9 @@ async def _quote_melhor_envio(payload: ShippingQuoteRequest) -> list[ShippingQuo
             },
             json=request_body,
         )
+        if response.status_code == 401:
+            log.error("Melhor Envio: token inválido ou expirado (401). Verifique MELHOR_ENVIO_TOKEN no Secret Manager.")
+            return []
         response.raise_for_status()
         payload_response = response.json()
 
