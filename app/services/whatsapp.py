@@ -262,6 +262,7 @@ async def send_whatsapp_order_details_template(
                     "order_details": {
                         "reference_id": str(order_reference_id),
                         "type": "physical-goods",
+                        "status": "pending",
                         "currency": "BRL",
                         "payment_settings": [
                             {
