@@ -210,6 +210,122 @@ async def send_whatsapp_template(
         return resp.json()
 
 
+async def send_whatsapp_order_details_template(
+    to_phone: str,
+    template_name: str,
+    language_code: str = "pt_BR",
+    body_variables: list[str] | None = None,
+    order_reference_id: str = "",
+    order_item_name: str = "",
+    total_amount_brl: float = 0.0,
+    pix_key: str = "",
+) -> dict[str, Any]:
+    """Envia template ORDER_DETAILS com botão de pagamento PIX.
+
+    Args:
+        to_phone: Número de destino com DDI (ex: '5511999999999').
+        template_name: Nome exato do template ORDER_DETAILS aprovado na Meta.
+        language_code: Código de idioma do template (padrão 'pt_BR').
+        body_variables: Variáveis para o corpo do template.
+        order_reference_id: ID do pedido (reference_id no action).
+        order_item_name: Nome/descrição do item exibido no resumo de pedido.
+        total_amount_brl: Valor total em reais (ex: 150.00).
+        pix_key: Chave PIX para o pagamento.
+
+    Returns:
+        Resposta da API da Meta.
+    """
+    settings = get_settings()
+    if not settings.meta_whatsapp_access_token or not settings.meta_whatsapp_phone_number_id:
+        return {"error": "META_WHATSAPP_ACCESS_TOKEN ou META_WHATSAPP_PHONE_NUMBER_ID nao configurados."}
+
+    total_centavos = round(total_amount_brl * 100)
+
+    components: list[dict[str, Any]] = []
+    if body_variables:
+        components.append({
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": str(v)}
+                for v in body_variables
+            ],
+        })
+
+    components.append({
+        "type": "button",
+        "sub_type": "order_details",
+        "index": 0,
+        "parameters": [
+            {
+                "type": "action",
+                "action": {
+                    "order_details": {
+                        "reference_id": str(order_reference_id),
+                        "type": "physical-goods",
+                        "currency": "BRL",
+                        "payment_settings": [
+                            {
+                                "type": "pix",
+                                "pix": {
+                                    "code": pix_key,
+                                },
+                            }
+                        ],
+                        "order": {
+                            "items": [
+                                {
+                                    "name": (order_item_name[:60] if order_item_name else "Pedido"),
+                                    "quantity": 1,
+                                    "amount": {
+                                        "offset": 100,
+                                        "value": total_centavos,
+                                    },
+                                }
+                            ],
+                            "subtotal": {
+                                "offset": 100,
+                                "value": total_centavos,
+                            },
+                        },
+                        "total_amount": {
+                            "offset": 100,
+                            "value": total_centavos,
+                        },
+                    }
+                },
+            }
+        ],
+    })
+
+    url = f"https://graph.facebook.com/v19.0/{settings.meta_whatsapp_phone_number_id}/messages"
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code},
+            "components": components,
+        },
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {settings.meta_whatsapp_access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        if resp.is_error:
+            return {
+                "error": "Meta API error",
+                "status_code": resp.status_code,
+                "response": resp.text,
+            }
+        return resp.json()
+
+
 async def get_whatsapp_media_url(media_id: str) -> dict[str, Any]:
     """Resolve URL temporária de uma mídia recebida via WhatsApp Business API."""
     settings = get_settings()

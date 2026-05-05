@@ -66,6 +66,7 @@ from app.services.whatsapp import (
     send_whatsapp_image,
     send_whatsapp_image_by_id,
     send_whatsapp_message,
+    send_whatsapp_order_details_template,
     send_whatsapp_template,
 )
 from app.services.woocommerce import sync_products_from_woocommerce
@@ -488,6 +489,7 @@ async def _send_pix_review_to_admins(
         result = await send_whatsapp_template(
             to_phone=phone,
             template_name=settings.pix_review_template_name,
+            language_code=settings.pix_review_template_language,
             body_variables=[
                 str(_field_val(order, "id", "")),
                 _field_val(customer, "name") or _field_val(order, "customer_name") or "Sem nome",
@@ -553,6 +555,7 @@ async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Sess
                     await send_whatsapp_template(
                         to_phone=customer_phone,
                         template_name=settings.order_confirmed_template_name,
+                        language_code=settings.order_confirmed_template_language,
                         body_variables=[
                             order.get("customer_name", "Cliente").split()[0],
                             str(order_id),
@@ -616,6 +619,7 @@ async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Sess
             await send_whatsapp_template(
                 to_phone=customer.whatsapp_phone,
                 template_name=settings.order_confirmed_template_name,
+                language_code=settings.order_confirmed_template_language,
                 body_variables=[
                     (customer.name or "Cliente").split()[0],
                     str(order.id),
@@ -715,6 +719,7 @@ async def confirm_order_payment_internal(
                 await send_whatsapp_template(
                     to_phone=customer_phone,
                     template_name=settings.order_confirmed_template_name,
+                    language_code=settings.order_confirmed_template_language,
                     body_variables=[
                         order.get("customer_name", "Cliente").split()[0],
                         str(order_id),
@@ -769,6 +774,7 @@ async def confirm_order_payment_internal(
         await send_whatsapp_template(
             to_phone=customer.whatsapp_phone,
             template_name=settings.order_confirmed_template_name,
+            language_code=settings.order_confirmed_template_language,
             body_variables=[
                 (customer.name or "Cliente").split()[0],
                 str(order.id),
@@ -1022,16 +1028,22 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
         )
 
         if customer_phone:
-            client_result = await send_whatsapp_template(
+            total_brl = float(order.get("total_amount", 0) or 0)
+            client_result = await send_whatsapp_order_details_template(
                 to_phone=customer_phone,
                 template_name=settings.pix_awaiting_template_name,
+                language_code=settings.pix_awaiting_template_language,
                 body_variables=[
                     ((customer or {}).get("name") or order.get("customer_name") or "Cliente").split()[0],
                     str(order_id),
                     products_list,
-                    f"{float(order.get('total_amount', 0) or 0):.2f}",
+                    f"{total_brl:.2f}",
                     settings.pix_key or "a combinar",
                 ],
+                order_reference_id=str(order_id),
+                order_item_name=products_list,
+                total_amount_brl=total_brl,
+                pix_key=settings.pix_key or "",
             )
             if isinstance(client_result, dict) and client_result.get("error"):
                 log.error("Falha ao enviar pedido_aguardando_pix para %s: %s", customer_phone, client_result)
@@ -1059,9 +1071,10 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
     products_list = ", ".join(f"{i.product_name_snapshot} ({i.quantity}m)" for i in items)
 
     if customer and customer.whatsapp_phone:
-        client_result = await send_whatsapp_template(
+        client_result = await send_whatsapp_order_details_template(
             to_phone=customer.whatsapp_phone,
             template_name=settings.pix_awaiting_template_name,
+            language_code=settings.pix_awaiting_template_language,
             body_variables=[
                 (customer.name or "Cliente").split()[0],
                 str(order.id),
@@ -1069,6 +1082,10 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
                 f"{order.total_amount:.2f}",
                 settings.pix_key or "a combinar",
             ],
+            order_reference_id=str(order.id),
+            order_item_name=products_list,
+            total_amount_brl=float(order.total_amount),
+            pix_key=settings.pix_key or "",
         )
         if isinstance(client_result, dict) and client_result.get("error"):
             log.error("Falha ao enviar pedido_aguardando_pix para %s: %s", customer.whatsapp_phone, client_result)
@@ -1254,6 +1271,7 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
     templates = [
         {
             "name": settings.pix_awaiting_template_name,
+            "language": settings.pix_awaiting_template_language,
             "variables": [
                 "Santiago",
                 "999",
@@ -1264,6 +1282,7 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
         },
         {
             "name": settings.order_confirmed_template_name,
+            "language": settings.order_confirmed_template_language,
             "variables": [
                 "Santiago",
                 "999",
@@ -1274,6 +1293,7 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
         },
         {
             "name": settings.pix_review_template_name,
+            "language": settings.pix_review_template_language,
             "variables": [
                 "999",
                 "Santiago Teste",
@@ -1284,6 +1304,7 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
         },
         {
             "name": settings.order_separation_template_name,
+            "language": settings.order_separation_template_language,
             "variables": [
                 "999",
                 "Santiago Teste",
@@ -1298,11 +1319,24 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
 
     results = {}
     for tpl in templates:
-        result = await send_whatsapp_template(
-            to_phone=phone,
-            template_name=tpl["name"],
-            body_variables=tpl["variables"],
-        )
+        if tpl["name"] == settings.pix_awaiting_template_name:
+            result = await send_whatsapp_order_details_template(
+                to_phone=phone,
+                template_name=tpl["name"],
+                language_code=tpl.get("language", "pt_BR"),
+                body_variables=tpl["variables"],
+                order_reference_id="999",
+                order_item_name="Helanca Verde (2m), Malha Branca (1m)",
+                total_amount_brl=150.0,
+                pix_key=settings.pix_key or "",
+            )
+        else:
+            result = await send_whatsapp_template(
+                to_phone=phone,
+                template_name=tpl["name"],
+                language_code=tpl.get("language", "pt_BR"),
+                body_variables=tpl["variables"],
+            )
         if isinstance(result, dict) and result.get("error"):
             results[tpl["name"]] = {"status": "error", "detail": result}
         else:
@@ -1480,7 +1514,7 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
                     template_result = await send_whatsapp_template(
                         to_phone=customer_phone,
                         template_name=settings.order_confirmed_template_name,
-                        language_code="pt_BR",
+                        language_code=settings.order_confirmed_template_language,
                         body_variables=[
                             (customer_name or "Cliente").split()[0],
                             str(order_id),
@@ -1569,7 +1603,7 @@ async def mercadopago_webhook(request: Request, session: SessionDep) -> dict[str
             template_result = await send_whatsapp_template(
                 to_phone=customer.whatsapp_phone,
                 template_name=settings.order_confirmed_template_name,
-                language_code="pt_BR",
+                language_code=settings.order_confirmed_template_language,
                 body_variables=[
                     (customer.name or "Cliente").split()[0],  # {{1}} = primeiro nome
                     str(order.id),                             # {{2}} = número do pedido
