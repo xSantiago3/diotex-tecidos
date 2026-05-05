@@ -265,7 +265,7 @@ async def send_whatsapp_order_details_template(
                         "currency": "BRL",
                         "payment_settings": [
                             {
-                                "type": "pix",
+                                "type": "pix_static_code",
                             }
                         ],
                         "order": {
