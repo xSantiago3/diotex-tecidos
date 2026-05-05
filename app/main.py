@@ -1242,6 +1242,77 @@ async def delete_customer_endpoint(phone: str, request: Request) -> dict[str, An
     return {"phone": phone, "deleted": result}
 
 
+@app.post("/internal/test-templates/{phone}")
+async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any]:
+    """Envia os 4 templates WhatsApp com dados fictícios para o número informado.
+
+    Útil para validar templates aprovados pela Meta. Requer X-Scheduler-Token.
+    """
+    token = request.headers.get("X-Scheduler-Token") or request.query_params.get("token")
+    _validate_scheduler_token(token)
+
+    templates = [
+        {
+            "name": settings.pix_awaiting_template_name,
+            "variables": [
+                "Santiago",
+                "999",
+                "Helanca Verde (2m), Malha Branca (1m)",
+                "150,00",
+                settings.pix_key or "11.999.999/0001-00",
+            ],
+        },
+        {
+            "name": settings.order_confirmed_template_name,
+            "variables": [
+                "Santiago",
+                "999",
+                "Helanca Verde (2m), Malha Branca (1m)",
+                "150,00",
+                "5 dias uteis",
+            ],
+        },
+        {
+            "name": settings.pix_review_template_name,
+            "variables": [
+                "999",
+                "Santiago Teste",
+                phone,
+                "Helanca Verde (2m), Malha Branca (1m)",
+                "150,00",
+            ],
+        },
+        {
+            "name": settings.order_separation_template_name,
+            "variables": [
+                "999",
+                "Santiago Teste",
+                "Helanca Verde (2m), Malha Branca (1m)",
+                "150,00",
+                "01310-100, n 45",
+                "https://etiqueta.exemplo.com/999.pdf",
+                "BR123456789BR",
+            ],
+        },
+    ]
+
+    results = {}
+    for tpl in templates:
+        result = await send_whatsapp_template(
+            to_phone=phone,
+            template_name=tpl["name"],
+            body_variables=tpl["variables"],
+        )
+        if isinstance(result, dict) and result.get("error"):
+            results[tpl["name"]] = {"status": "error", "detail": result}
+        else:
+            msg_id = (result.get("messages") or [{}])[0].get("id", "?")
+            results[tpl["name"]] = {"status": "ok", "message_id": msg_id}
+
+    log.info("test-templates enviados para %s: %s", phone, results)
+    return {"phone": phone, "results": results}
+
+
 @app.post("/internal/reset-session/{phone}")
 async def reset_agent_session(phone: str, request: Request) -> dict[str, Any]:
     """Apaga e recria a sessão ADK de um número, zerando o histórico da conversa."""

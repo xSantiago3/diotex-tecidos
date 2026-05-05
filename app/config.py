@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     google_cloud_project: str | None = Field(default=None, alias="GOOGLE_CLOUD_PROJECT")
     pix_key: str = Field(default="", alias="PIX_KEY")
     order_confirmed_template_name: str = Field(default="pedido_confirmado", alias="ORDER_CONFIRMED_TEMPLATE_NAME")
-    order_separation_template_name: str = Field(default="separar_pedido", alias="ORDER_SEPARATION_TEMPLATE_NAME")
+    order_separation_template_name: str = Field(default="separar_pedido2", alias="ORDER_SEPARATION_TEMPLATE_NAME")
     pix_awaiting_template_name: str = Field(default="pedido_aguardando_pix", alias="PIX_AWAITING_TEMPLATE_NAME")
     pix_review_template_name: str = Field(default="avaliar_pagamento_pix", alias="PIX_REVIEW_TEMPLATE_NAME")
     # Telefone para notificações de pagamento aprovado (padrão: mesmo do admin)
