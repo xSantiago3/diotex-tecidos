@@ -1264,9 +1264,11 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
     """Envia os 4 templates WhatsApp com dados fictícios para o número informado.
 
     Útil para validar templates aprovados pela Meta. Requer X-Scheduler-Token.
+    Use ?template=nome para enviar apenas um template específico.
     """
     token = request.headers.get("X-Scheduler-Token") or request.query_params.get("token")
     _validate_scheduler_token(token)
+    filter_template = request.query_params.get("template")
 
     templates = [
         {
@@ -1319,6 +1321,8 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
 
     results = {}
     for tpl in templates:
+        if filter_template and tpl["name"] != filter_template:
+            continue
         if tpl["name"] == settings.pix_awaiting_template_name:
             result = await send_whatsapp_order_details_template(
                 to_phone=phone,

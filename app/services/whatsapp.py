@@ -270,6 +270,7 @@ async def send_whatsapp_order_details_template(
                             }
                         ],
                         "order": {
+                            "status": "pending",
                             "items": [
                                 {
                                     "name": (order_item_name[:60] if order_item_name else "Pedido"),
