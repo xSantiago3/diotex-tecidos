@@ -1041,9 +1041,12 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
                     settings.pix_key or "a combinar",
                 ],
                 order_reference_id=str(order_id),
-                order_item_name=products_list,
+                order_items=items,
                 total_amount_brl=total_brl,
+                shipping_amount_brl=float(order.get("shipping_amount", 0) or 0),
                 pix_key=settings.pix_key or "",
+                pix_key_type=settings.pix_key_type,
+                pix_merchant_name=settings.pix_merchant_name,
             )
             if isinstance(client_result, dict) and client_result.get("error"):
                 log.error("Falha ao enviar pedido_aguardando_pix para %s: %s", customer_phone, client_result)
@@ -1083,9 +1086,18 @@ async def notify_pix_pending(order_id: int, session: SessionDep) -> dict[str, An
                 settings.pix_key or "a combinar",
             ],
             order_reference_id=str(order.id),
-            order_item_name=products_list,
+            order_items=[{
+                "product_id": i.product_id,
+                "product_name_snapshot": i.product_name_snapshot,
+                "quantity": i.quantity,
+                "unit_price_snapshot": i.unit_price_snapshot,
+                "line_total": i.line_total,
+            } for i in items],
             total_amount_brl=float(order.total_amount),
+            shipping_amount_brl=float(order.shipping_amount or 0.0),
             pix_key=settings.pix_key or "",
+            pix_key_type=settings.pix_key_type,
+            pix_merchant_name=settings.pix_merchant_name,
         )
         if isinstance(client_result, dict) and client_result.get("error"):
             log.error("Falha ao enviar pedido_aguardando_pix para %s: %s", customer.whatsapp_phone, client_result)
@@ -1330,9 +1342,14 @@ async def test_templates_endpoint(phone: str, request: Request) -> dict[str, Any
                 language_code=tpl.get("language", "pt_BR"),
                 body_variables=tpl["variables"],
                 order_reference_id="999",
-                order_item_name="Helanca Verde (2m), Malha Branca (1m)",
+                order_items=[
+                    {"product_id": 1, "product_name_snapshot": "Helanca Verde", "quantity": 2, "unit_price_snapshot": 50.0, "line_total": 100.0},
+                    {"product_id": 2, "product_name_snapshot": "Malha Branca", "quantity": 1, "unit_price_snapshot": 50.0, "line_total": 50.0},
+                ],
                 total_amount_brl=150.0,
                 pix_key=settings.pix_key or "",
+                pix_key_type=settings.pix_key_type,
+                pix_merchant_name=settings.pix_merchant_name,
             )
         else:
             result = await send_whatsapp_template(

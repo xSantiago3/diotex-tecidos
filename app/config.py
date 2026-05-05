@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     firestore_enabled: bool = Field(default=False, alias="FIRESTORE_ENABLED")
     google_cloud_project: str | None = Field(default=None, alias="GOOGLE_CLOUD_PROJECT")
     pix_key: str = Field(default="", alias="PIX_KEY")
+    pix_key_type: str = Field(default="CPF", alias="PIX_KEY_TYPE")
+    pix_merchant_name: str = Field(default="Diotex Tecidos", alias="PIX_MERCHANT_NAME")
     order_confirmed_template_name: str = Field(default="pedido_confirmado", alias="ORDER_CONFIRMED_TEMPLATE_NAME")
     order_confirmed_template_language: str = Field(default="pt_BR", alias="ORDER_CONFIRMED_TEMPLATE_LANGUAGE")
     order_separation_template_name: str = Field(default="separar_pedido2", alias="ORDER_SEPARATION_TEMPLATE_NAME")

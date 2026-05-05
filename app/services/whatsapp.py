@@ -216,9 +216,12 @@ async def send_whatsapp_order_details_template(
     language_code: str = "pt_BR",
     body_variables: list[str] | None = None,
     order_reference_id: str = "",
-    order_item_name: str = "",
+    order_items: list[dict] | None = None,
     total_amount_brl: float = 0.0,
+    shipping_amount_brl: float = 0.0,
     pix_key: str = "",
+    pix_key_type: str = "CPF",
+    pix_merchant_name: str = "Diotex Tecidos",
 ) -> dict[str, Any]:
     """Envia template ORDER_DETAILS com botão de pagamento PIX.
 
@@ -228,7 +231,8 @@ async def send_whatsapp_order_details_template(
         language_code: Código de idioma do template (padrão 'pt_BR').
         body_variables: Variáveis para o corpo do template.
         order_reference_id: ID do pedido (reference_id no action).
-        order_item_name: Nome/descrição do item exibido no resumo de pedido.
+        order_items: Lista de itens do pedido, cada um com campos:
+            product_id, product_name_snapshot, quantity, unit_price_snapshot, line_total.
         total_amount_brl: Valor total em reais (ex: 150.00).
         pix_key: Chave PIX para o pagamento.
 
@@ -240,6 +244,37 @@ async def send_whatsapp_order_details_template(
         return {"error": "META_WHATSAPP_ACCESS_TOKEN ou META_WHATSAPP_PHONE_NUMBER_ID nao configurados."}
 
     total_centavos = round(total_amount_brl * 100)
+    shipping_centavos = round(shipping_amount_brl * 100)
+
+    # Constrói lista de itens para o order_details
+    if order_items:
+        meta_items = []
+        subtotal_centavos = 0
+        for i, item in enumerate(order_items):
+            name = str(item.get("product_name_snapshot") or item.get("product_name") or "Produto")
+            qty = int(item.get("quantity") or 1)
+            unit_price = float(item.get("unit_price_snapshot") or item.get("unit_price") or 0.0)
+            unit_centavos = round(unit_price * 100)
+            subtotal_centavos += unit_centavos * qty
+            product_id = str(item.get("product_id") or (i + 1))
+            meta_items.append({
+                "retailer_id": f"{order_reference_id}-{product_id}",
+                "name": name[:60],
+                "quantity": qty,
+                "amount": {
+                    "offset": 100,
+                    "value": unit_centavos,
+                },
+            })
+    else:
+        # Fallback: item único com total
+        meta_items = [{
+            "retailer_id": str(order_reference_id) or "1",
+            "name": "Pedido",
+            "quantity": 1,
+            "amount": {"offset": 100, "value": total_centavos},
+        }]
+        subtotal_centavos = total_centavos
 
     components: list[dict[str, Any]] = []
     if body_variables:
@@ -269,25 +304,20 @@ async def send_whatsapp_order_details_template(
                                 "type": "pix_dynamic_code",
                                 "pix_dynamic_code": {
                                     "code": pix_key,
+                                    "merchant_name": pix_merchant_name,
+                                    "key_type": pix_key_type,
+                                    "key": pix_key,
                                 },
                             }
                         ],
                         "order": {
                             "status": "pending",
-                            "items": [
-                                {
-                                    "name": (order_item_name[:60] if order_item_name else "Pedido"),
-                                    "quantity": 1,
-                                    "amount": {
-                                        "offset": 100,
-                                        "value": total_centavos,
-                                    },
-                                }
-                            ],
+                            "items": meta_items,
                             "subtotal": {
                                 "offset": 100,
-                                "value": total_centavos,
+                                "value": subtotal_centavos,
                             },
+                            **({"shipping": {"offset": 100, "value": shipping_centavos}} if shipping_centavos > 0 else {}),
                         },
                         "total_amount": {
                             "offset": 100,
