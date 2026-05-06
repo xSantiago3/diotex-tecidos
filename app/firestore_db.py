@@ -257,7 +257,7 @@ async def get_latest_pending_pix_order_firestore(customer_whatsapp: str) -> dict
         db.collection("orders")
         .where("customer_whatsapp", "==", customer_whatsapp)
         .where("payment_provider", "==", "pix_manual")
-        .where("status", "==", "payment_under_review")
+        .where("status", "in", ["payment_under_review", "awaiting_payment"])
         .stream()
     )
     latest_order: dict[str, Any] | None = None

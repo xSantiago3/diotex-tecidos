@@ -314,7 +314,7 @@ def _get_latest_pending_pix_order_sql(session: Session, customer_phone: str) -> 
         .where(
             Order.customer_id == customer.id,
             Order.payment_provider == "pix_manual",
-            Order.status == OrderStatus.payment_under_review,
+            Order.status.in_([OrderStatus.payment_under_review, OrderStatus.awaiting_payment]),
         )
         .order_by(Order.updated_at.desc())
     ).first()
@@ -386,7 +386,7 @@ async def _forward_pix_receipt_to_admins(
                     caption=f"Comprovante do pedido #{order_id}",
                 )
 
-    await _send_pix_review_to_admins(order, customer, items)
+    await _send_pix_review_to_admins(order, customer, items, incoming_message)
 
 
 async def _maybe_handle_pix_receipt(
@@ -404,6 +404,14 @@ async def _maybe_handle_pix_receipt(
     if settings.firestore_enabled:
         order = await get_latest_pending_pix_order_firestore(customer_phone)
         if not order:
+            log.info(
+                "Comprovante recebido, mas sem pedido PIX elegivel",
+                extra={
+                    "event": "pix_receipt_no_pending_order",
+                    "customer_phone": customer_phone,
+                    "backend": "firestore",
+                },
+            )
             return False
         items = await get_order_items_firestore(int(order.get("id") or 0))
         customer_doc = await get_customer_firestore(customer_phone)
@@ -411,6 +419,14 @@ async def _maybe_handle_pix_receipt(
     else:
         order = _get_latest_pending_pix_order_sql(session, customer_phone)
         if not order:
+            log.info(
+                "Comprovante recebido, mas sem pedido PIX elegivel",
+                extra={
+                    "event": "pix_receipt_no_pending_order",
+                    "customer_phone": customer_phone,
+                    "backend": "sql",
+                },
+            )
             return False
         from sqlmodel import select as sql_select
         from app.models import OrderItem
@@ -479,27 +495,50 @@ async def _send_pix_review_to_admins(
     order: Any,
     customer: Any,
     items: list[Any],
+    incoming_message: dict[str, Any] | None = None,
 ) -> None:
     """Envia template 'avaliar_pagamento_pix' (com botões confirmar/rejeitar) para admins."""
     products_list = ", ".join(
         f"{_field_val(i, 'product_name_snapshot', '')} ({_field_val(i, 'quantity', 1)}m)" for i in items
     )
+
+    template_name = settings.pix_review_template_name
+    template_language = settings.pix_review_template_language
+    if settings.pix_review_media_templates_enabled and incoming_message:
+        message_type = incoming_message.get("type")
+        mime_type = str(incoming_message.get("mime_type") or "").lower()
+        if message_type == "image":
+            template_name = settings.pix_review_photo_template_name or template_name
+            template_language = settings.pix_review_photo_template_language or template_language
+        elif message_type == "document" and "pdf" in mime_type:
+            template_name = settings.pix_review_pdf_template_name or template_name
+            template_language = settings.pix_review_pdf_template_language or template_language
+
+    body_variables = [
+        str(_field_val(order, "id", "")),
+        _field_val(customer, "name") or _field_val(order, "customer_name") or "Sem nome",
+        _field_val(customer, "whatsapp_phone") or _field_val(order, "customer_whatsapp") or "-",
+        products_list,
+        f"{float(_field_val(order, 'total_amount', 0) or 0):.2f}",
+    ]
+
     for phone in _admin_phones():
         _pending_pix_reviews[phone] = int(_field_val(order, "id", 0) or 0)
         result = await send_whatsapp_template(
             to_phone=phone,
-            template_name=settings.pix_review_template_name,
-            language_code=settings.pix_review_template_language,
-            body_variables=[
-                str(_field_val(order, "id", "")),
-                _field_val(customer, "name") or _field_val(order, "customer_name") or "Sem nome",
-                _field_val(customer, "whatsapp_phone") or _field_val(order, "customer_whatsapp") or "-",
-                products_list,
-                f"{float(_field_val(order, 'total_amount', 0) or 0):.2f}",
-            ],
+            template_name=template_name,
+            language_code=template_language,
+            body_variables=body_variables,
         )
         if isinstance(result, dict) and result.get("error"):
-            log.error("Falha ao enviar avaliar_pagamento_pix para %s: %s", phone, result)
+            fallback_result = await send_whatsapp_template(
+                to_phone=phone,
+                template_name=settings.pix_review_template_name,
+                language_code=settings.pix_review_template_language,
+                body_variables=body_variables,
+            )
+            if isinstance(fallback_result, dict) and fallback_result.get("error"):
+                log.error("Falha ao enviar avaliar_pagamento_pix para %s: %s", phone, fallback_result)
 
 
 async def _handle_admin_button_reply(button_reply: dict[str, Any], session: Session) -> None:
