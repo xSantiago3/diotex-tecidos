@@ -65,7 +65,7 @@ def _aggregate_dimensions(items: list[tuple[Product, float]]) -> tuple[float, fl
         max_width_cm = max(max_width_cm, product.package_width_cm)
         total_height_cm += product.package_height_cm * quantity
 
-    return total_weight_g, max_length_cm, max_width_cm, total_height_cm
+    return total_weight_g, max_length_cm, max_width_cm, min(total_height_cm, 100.0)
 
 
 def _load_cart_items(session: Session, items: list[CheckoutItemRequest]) -> tuple[list[tuple[Product, float]], list[CheckoutItemResponse], float]:

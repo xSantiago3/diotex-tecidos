@@ -910,7 +910,7 @@ async def _build_open_cart_checkout_snapshot(
             "weight_g": total_weight_g,
             "length_cm": max_length_cm,
             "width_cm": max_width_cm,
-            "height_cm": max(total_height_cm, 1.0),
+            "height_cm": min(max(total_height_cm, 1.0), 100.0),
         }
 
 
