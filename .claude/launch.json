@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "diotex-web",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd /Users/xsantiago3/Documents/src/diotextecidos-web && npm run dev"],
+      "port": 3000
+    }
+  ]
+}
